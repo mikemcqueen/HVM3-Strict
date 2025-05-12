@@ -111,15 +111,16 @@ enum : u64 {
   CLINE_U64 = CLINE_BYTES / sizeof(u64),
 
   // Threads per CPU
-  TPC = 8,
+  TPC = 10,
 
   // Various redex bag starting indices within the heap to choose from.
   // The remaining percentage is used for node storage.
 
-  // Cache-aligned and named for the percentage of heap used.
+  // Named for the percentage of heap used.
   RBAG_25_PCT = (HEAP_SIZE / 4),
   RBAG_50_PCT = (HEAP_SIZE / 2),
   RBAG_75_PCT = (HEAP_SIZE - (HEAP_SIZE / 4)),
+  // TODO: something like: RBAG_1024_DEX, for 1024 redex per thread
 
   ////////////////////////////////////
   // Choose a RBAG size here
@@ -129,11 +130,11 @@ enum : u64 {
 
 enum : u32 {
   // Final calculated RBAG index
-  RBAG = (HEAP_SIZE - RBAG_SIZE) / sizeof(u64),
+  RBAG = ((HEAP_SIZE - RBAG_SIZE) / sizeof(u64)) & ~7U, // CLINE_U64 - 1
 
   // Calculate RBAG_LEN and NODE_LEN: number of u64 elements *per thread*
   // TODO: MUST be 16-byte aligned. 64-byte alignment might be preferable.
-  RBAG_LEN = (RBAG_SIZE / (TPC * sizeof(u64))) & ~15U,
+  RBAG_LEN = (RBAG_SIZE / (TPC * sizeof(u64))) & ~7U, // CLINE_U64 - 1
   NODE_LEN = (HEAP_SIZE - RBAG_SIZE) / (TPC * sizeof(u64))
 };
 
@@ -271,6 +272,7 @@ static Term term_offset_loc(Term term, Loc offset) {
   return term_with_loc(term, loc);
 }
 
+//#define DEBUG
 static int mop_debug = 0; // memory operations
 static int thd_debug = 0; // threading
 
@@ -290,12 +292,14 @@ static bool good_loc(Loc loc) { return true; }
 Term swap(Loc loc, Term term) {
   Term res = atomic_exchange_explicit((a64*)&BUFF[loc], term, memory_order_relaxed);
 
+#ifdef DEBUG
   if (mop_debug && good_loc(loc)) {
     char buf1[TERMSTR_BUFSIZ];
     char buf2[TERMSTR_BUFSIZ];
     fprintf(stderr, "%d swap %u %s with %s\n", thread_id, loc,
         term_str(buf1, res), term_str(buf2, term));
   }
+#endif
 
   return res;
 }
@@ -303,10 +307,12 @@ Term swap(Loc loc, Term term) {
 Term get(Loc loc) {
   Term term = atomic_load_explicit((a64*)&BUFF[loc], memory_order_relaxed);
 
+#ifdef DEBUG
   if (mop_debug && good_loc(loc)) {
     char buf[TERMSTR_BUFSIZ];
     fprintf(stderr, "%d get %u %s\n", thread_id, loc, term_str(buf, term));
   }
+#endif
 
   return term;
 }
@@ -314,10 +320,12 @@ Term get(Loc loc) {
 Term take(Loc loc) {
   Term term = atomic_exchange_explicit((a64*)&BUFF[loc], VOID, memory_order_relaxed);
 
+#ifdef DEBUG
   if (mop_debug && good_loc(loc)) {
     char buf[TERMSTR_BUFSIZ];
     fprintf(stderr, "%d take %u %s\n", thread_id, loc, term_str(buf, term));
   }
+#endif
 
   return term;
 }
@@ -325,20 +333,24 @@ Term take(Loc loc) {
 void set(Loc loc, Term term) {
   atomic_store_explicit((a64*)&BUFF[loc], term, memory_order_relaxed);
 
+#ifdef DEBUG
   if (mop_debug && good_loc(loc)) {
     char buf[TERMSTR_BUFSIZ];
     fprintf(stderr, "%d set %u %s\n", thread_id, loc, term_str(buf, term));
   }
+#endif
 }
 
 static Pair take_pair(Loc loc) {
   Pair pair = __atomic_exchange_n((Pair*)&BUFF[loc], 0ULL, __ATOMIC_RELAXED);
 
+#ifdef DEBUG
   if (mop_debug) {
     char buf[TERMSTR_BUFSIZ];
     fprintf(stderr, "%d take.neg %u %s\n", thread_id, loc, term_str(buf, pair_neg(pair)));
     fprintf(stderr, "%d take.pos %u %s\n", thread_id, loc + 1, term_str(buf, pair_pos(pair)));
   }
+#endif
 
   return pair;
 }
@@ -346,11 +358,13 @@ static Pair take_pair(Loc loc) {
 static void set_pair(Loc loc, Pair pair) {
   __atomic_store_n((Pair*)&BUFF[loc], pair, __ATOMIC_RELAXED);
 
+#ifdef DEBUG
   if (mop_debug) {
     char buf[TERMSTR_BUFSIZ];
     fprintf(stderr, "%d set.neg %u %s\n", thread_id, loc, term_str(buf, pair_neg(pair)));
     fprintf(stderr, "%d set.pos %u %s\n", thread_id, loc + 1, term_str(buf, pair_pos(pair)));
   }
+#endif
 }
 
 static Loc port(u64 n, Loc loc) { return n + loc - 1; }
@@ -359,9 +373,11 @@ static Loc port(u64 n, Loc loc) { return n + loc - 1; }
 // ---------
 
 static Loc node_alloc(TM *tm, u32 num) {
+#ifdef DEBUG
   if (mop_debug) {
     fprintf(stderr, "%u alloc %u nodes at %u\n", tm->tid, num, tm->nput);
   }
+#endif
 
   if (tm->nput + num >= NODE_LEN) {
     fprintf(stderr, "node space exhausted\n");
@@ -384,9 +400,11 @@ static void rbag_push(TM *tm, Term neg, Term pos) {
 
   Loc loc = RBAG + tm->tid * RBAG_LEN + tm->rput;
 
+#ifdef DEBUG
   if (0 && mop_debug) {
     fprintf(stderr, "%u calling set_pair @ %u, rput %u\n", tm->tid, loc, tm->rput);
   }
+#endif
 
   set_pair(loc, pair_new(neg, pos));
   tm->rput += 2;
@@ -414,7 +432,7 @@ void hvm_init() {
 
   alloc_static_tms();
 
-  #if 0
+  #if 0 
   fprintf(stderr, "HEAP_SIZE = %" PRIu64 "\n", HEAP_SIZE);
   fprintf(stderr, "RBAG_SIZE = %" PRIu64 "\n", RBAG_SIZE);
   fprintf(stderr, "RBAG      = %u\n", RBAG);
@@ -527,10 +545,12 @@ static Term expand_ref(TM *tm, Loc def_idx) {
   // offset calculation must occur before node_alloc() call
   Loc offset = (tm->tid * NODE_LEN) + tm->nput - 1;
 
+#ifdef DEBUG
   if (mop_debug) {
     fprintf(stderr, "%u expand_ref %u nodes %u rbag %u offset %u\n", tm->tid,
         def_idx, nodes_len, rbag_len, offset);
   }
+#endif
 
   node_alloc(tm, nodes_len - 1);
 
@@ -542,10 +562,12 @@ static Term expand_ref(TM *tm, Loc def_idx) {
     Term term = term_offset_loc(nodes[i], offset);
     BUFF[loc] = term;
 
+#ifdef DEBUG
     if (mop_debug) {
       char buf[TERMSTR_BUFSIZ];
       fprintf(stderr, "%u node %u %s\n", tm->tid, loc, term_str(buf, term));
     }
+#endif
   }
 
   for (u32 i = 0; i < rbag_len; i += 2) {
@@ -1338,7 +1360,7 @@ static void* thread_func(void* arg) {
   atomic_fetch_add(&net.nods, tm->nput);
   atomic_fetch_add(&net.itrs, tm->itrs);
 
-  if (1) {
+  if (0) {
     fprintf(stderr, "t%u: %" PRIu64 " itrs, steals: %u good %u bad\n",
             tm->tid, tm->itrs, tm->sgud, tm->sbad);
   }
@@ -1383,7 +1405,8 @@ Term normalize(Term term) {
     TM *tm = tms[0];
     while (sequential_step(tm))
       ;
-    atomic_fetch_add(&net.nods, tm->nput);
+    net.nods = tm->nput;
+    net.itrs = tm->itrs;
   } else {
     parallel_normalize();
   }
