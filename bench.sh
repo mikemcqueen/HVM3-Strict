@@ -13,11 +13,12 @@ min_mips=999999999
 max_mips=0
 first_itrs=0
 first_size=0
+outfile=out
 
 echo "Running $cmd for $num_iters iterations..."
 
 for (( i=1; i<=$num_iters; i++ )); do
-    output=$($cmd 2>/dev/null)
+    output=$($cmd 2>$outfile)
     
     mips=$(echo "$output" | grep "MIPS:" | awk '{print $2}')
     itrs=$(echo "$output" | grep "ITRS:" | awk '{print $2}')
@@ -32,16 +33,20 @@ for (( i=1; i<=$num_iters; i++ )); do
         first_itrs="$itrs"
     elif [ "$first_itrs" -ne "$itrs" ]; then
         echo "ERROR: ITRS: $itrs mismatch with first ITRS: $first_itrs"
+        echo "Output:"
+        echo "$output"
+        exit 1
     fi
 
     if [ "$first_size" -eq 0 ]; then
         first_size="$size"
     elif [ "$first_size" -ne "$size" ]; then
         echo "ERROR: SIZE: $size mismatch with first SIZE: $first_size"
+        exit 1
     fi
 
     if [ "$mips" -lt "$min_mips" ]; then
-        min_mips=$mips
+        min_mips="$mips"
     fi
     
     if [ "$mips" -gt "$max_mips" ]; then
