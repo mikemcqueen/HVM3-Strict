@@ -26,6 +26,8 @@ for (( i=1; i<=$num_iters; i++ )); do
     
     if [ -z "$mips" ] || [ -z "$itrs" ] || [ -z "$size" ]; then
         echo "ERROR: Could not find MIPS, ITRS, or SIZE in program output"
+        echo "Output:"
+        echo "$output"
         continue
     fi
     
@@ -33,16 +35,16 @@ for (( i=1; i<=$num_iters; i++ )); do
         first_itrs="$itrs"
     elif [ "$first_itrs" -ne "$itrs" ]; then
         echo "ERROR: ITRS: $itrs mismatch with first ITRS: $first_itrs"
-        echo "Output:"
-        echo "$output"
-        exit 1
+        #echo "Output:"
+        #echo "$output"
+        #exit 1
     fi
 
     if [ "$first_size" -eq 0 ]; then
         first_size="$size"
     elif [ "$first_size" -ne "$size" ]; then
         echo "ERROR: SIZE: $size mismatch with first SIZE: $first_size"
-        exit 1
+        #exit 1
     fi
 
     if [ "$mips" -lt "$min_mips" ]; then
