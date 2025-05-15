@@ -135,7 +135,7 @@ enum : u32 {
   NODE_LEN = (HEAP_SIZE - RBAG_SIZE) / (TPC * sizeof(u64)),
 
   // Booty-bag length in u64 elements
-  BBAG_LEN = 8
+  BBAG_LEN = 96
 };
 
 typedef struct Net {
@@ -725,6 +725,9 @@ static Term expand_ref(TM *tm, Loc def_idx) {
   }
   #endif
 
+  bool buse = tm->buse;
+  tm->buse = false;
+
   for (u32 i = 0; i < rbag_len; i += 2) {
 #if 1 // old
     Term neg = term_offset_loc(rbag[i], offset);
@@ -737,6 +740,9 @@ static Term expand_ref(TM *tm, Loc def_idx) {
     //redex_push(tm, pair); 
 #endif
   }
+
+  tm->buse = buse;
+
   return root;
 }
 
@@ -768,6 +774,7 @@ static inline void move(TM *tm, Loc neg_loc, Term pos) {
   Term neg = swap(neg_loc, pos);
   if (term_tag(neg) != SUB) {
     // No need to take() since we already swapped
+    //set(neg_loc, 0);
     link_terms(tm, neg, pos);
   }
 }
@@ -778,10 +785,13 @@ static void interact_applam(TM *tm, Loc a_loc, Loc b_loc) {
   Loc ret = port(2, a_loc);
   Loc var = port(1, b_loc);
   Term bod = take(port(2, b_loc));
+
   bool buse = tm->buse;
-  tm->buse = false;
+  //tm->buse = false;
+
   move(tm, var, arg);
   move(tm, ret, bod);
+
   tm->buse = buse;
 }
 
@@ -1162,6 +1172,9 @@ static void interact_matnum(TM *tm, Loc mat_loc, Lab mat_len, u32 n, Tag n_type)
     exit(1);
   }
 
+  bool buse = tm->buse;
+  tm->buse = false;
+
   u32 i_arm = (n < mat_len - 1) ? n : (mat_len - 1);
   for (u32 i = 0; i < mat_len; i++) {
     if (i != i_arm) {
@@ -1182,6 +1195,8 @@ static void interact_matnum(TM *tm, Loc mat_loc, Lab mat_len, u32 n, Tag n_type)
 
     link_terms(tm, term_new(APP, 0, app), arm);
   }
+
+  tm->buse = buse;
 }
 
 static void interact_matsup(TM *tm, Loc mat_loc, Lab mat_len, Loc sup_loc) {
