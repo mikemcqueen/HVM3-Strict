@@ -174,16 +174,17 @@ static Book BOOK = {
 
 // Local Thread Memory
 typedef struct TM {
-  u32 tid;  // thread id
-  Loc nput; // next node allocation attempt index
-  Loc rput; // next rbag push index
-  Loc bput; // next (owned) bbag push index
-  Loc bpop; // next (stolen) bbag pop index
-  u32 btid; // tid from which bbag was stolen
-  u32 sgud; // successful steals
-  u32 sbad; // failed steals
-  u64 itrs; // interaction count
+  u32 tid;   // thread id
+  Loc nput;  // next node allocation attempt index
+  Loc rput;  // next rbag push index
+  Loc bput;  // next (owned) bbag push index
+  Loc bpop;  // next (stolen) bbag pop index + 2
+  u32 btid;  // tid from which bbag was stolen
+  u32 sgud;  // successful steal count
+  u32 sbad;  // failed steal count
+  u64 itrs;  // interaction count
   bool buse; // use booty bag
+  bool bfld; // booty bag was filled during current interaction
 } TM;
 
 static_assert(sizeof(TM) <= CACH_SIZ, "TM struct getting big");
@@ -239,6 +240,7 @@ TM *tm_new(u64 tid) {
   tm->sgud = 0;
   tm->sbad = 0;
   tm->buse = false;
+  tm->bfld = false;
   return tm;
 }
 
@@ -456,9 +458,8 @@ static bool bty_time(TM* tm) {
 static bool bbag_compare_swap(u32 tid, u32 expect, u32 desire,
                               memory_order success_order) {
   u32 orig = expect;
-  bool res = atomic_compare_exchange_strong_explicit(&bbs[tid]->ctrl, &expect,
-                 desire, success_order, memory_order_relaxed);
-  return res;
+  return atomic_compare_exchange_strong_explicit(&bbs[tid]->ctrl, &expect,
+      desire, success_order, memory_order_relaxed);
 }
 
 static void bbag_set(u32 tid, u32 val, memory_order order) {
@@ -466,21 +467,28 @@ static void bbag_set(u32 tid, u32 val, memory_order order) {
 }
 
 static u32 bbag_get(u32 tid) {
-  u32 got = atomic_load_explicit(&bbs[tid]->ctrl, memory_order_relaxed);
-  return got;
+  return atomic_load_explicit(&bbs[tid]->ctrl, memory_order_relaxed);
 }
 
 static Loc get_push_offset(TM *tm) {
+  // TODO: this is a little weird, but made sense yesterday. we only consider
+  // pushing to our booty bag if we aren't popping from a stolen booty bag.
+  // probably the assumption was that if we stole a bag, our bag must be empty
+  // (or stolen). in the empty case, it might be better perf to just push to it.
+  // in the stolen case, what if the bag we stole is our own? also might be 
+  // better perf in this case if we just put ot it.
   if (bty_time(tm)) {
-    // Consider pushing to booty bag
-    if (tm->bput >= BBAG_LEN) {
-      // BBAG is full, last we checked. But maybe it's empty now
-      if (bbag_get(tm->tid) == EMPTY) {
-        tm->bput = 0;
-        return tm->bput;
-      }        
+    if (tm->bput == BBAG_LEN) {
+      // Booty bag is full
+      if (0 && !tm->bfld) {
+        // It wasn't filled during this interaction
+        if (bbag_get(tm->tid) == EMPTY) {
+          tm->bput = 0;
+          return tm->bput;
+        }
+      }
     } else {
-      // BBAG isn't full, use it
+      // Booty bag isn't full
       return tm->bput;
     }
   }
@@ -506,7 +514,8 @@ static void rbag_push(TM *tm, Term neg, Term pos) {
   if (bty) {
     tm->bput += 2;
     if (tm->bput == BBAG_LEN) {
-      bbag_set(tm->tid, FULL, memory_order_release);
+      tm->bfld = true;
+      //bbag_set(tm->tid, FULL, memory_order_release);
     }
   } else {
     //#ifdef DEBUG
@@ -529,10 +538,10 @@ static void rbag_push(TM *tm, Term neg, Term pos) {
 
 static Pair rbag_pop(TM* tm) {
   if (tm->bpop > 0) {
-    // We stole a booty bag, use it
+    // We have a stolen, non-empty booty bag, use it
     tm->bpop -= 2;
 
-    // If stealing from own booty bag, adjust push index as well
+    // If it's our own booty bag, adjust push index as well
     if (tm->btid == tm->tid) {
       tm->bput -= 2;
     }
@@ -725,8 +734,8 @@ static Term expand_ref(TM *tm, Loc def_idx) {
   }
   #endif
 
-  bool buse = tm->buse;
-  tm->buse = false;
+  //bool buse = tm->buse;
+  //tm->buse = false;
 
   for (u32 i = 0; i < rbag_len; i += 2) {
 #if 1 // old
@@ -741,7 +750,7 @@ static Term expand_ref(TM *tm, Loc def_idx) {
 #endif
   }
 
-  tm->buse = buse;
+  //tm->buse = buse;
 
   return root;
 }
@@ -786,13 +795,13 @@ static void interact_applam(TM *tm, Loc a_loc, Loc b_loc) {
   Loc var = port(1, b_loc);
   Term bod = take(port(2, b_loc));
 
-  bool buse = tm->buse;
+  //bool buse = tm->buse;
   //tm->buse = false;
 
   move(tm, var, arg);
   move(tm, ret, bod);
 
-  tm->buse = buse;
+  //tm->buse = buse;
 }
 
 static void interact_appsup(TM *tm, Loc a_loc, Loc b_loc) {
@@ -1172,8 +1181,8 @@ static void interact_matnum(TM *tm, Loc mat_loc, Lab mat_len, u32 n, Tag n_type)
     exit(1);
   }
 
-  bool buse = tm->buse;
-  tm->buse = false;
+  //bool buse = tm->buse;
+  //tm->buse = false;
 
   u32 i_arm = (n < mat_len - 1) ? n : (mat_len - 1);
   for (u32 i = 0; i < mat_len; i++) {
@@ -1196,7 +1205,7 @@ static void interact_matnum(TM *tm, Loc mat_loc, Lab mat_len, u32 n, Tag n_type)
     link_terms(tm, term_new(APP, 0, app), arm);
   }
 
-  tm->buse = buse;
+  //tm->buse = buse;
 }
 
 static void interact_matsup(TM *tm, Loc mat_loc, Lab mat_len, Loc sup_loc) {
@@ -1466,7 +1475,7 @@ static bool try_steal(TM *tm) {
   return false;
 }
 
-static bool check_timeout(u32 tick) {
+static bool timeout(u32 tick) {
   if (tick % 256 == 0) {
     u32 idle = atomic_load_explicit(&net.idle, memory_order_relaxed);
     if (idle == TPC) {
@@ -1481,6 +1490,18 @@ static bool check_timeout(u32 tick) {
   return false;
 }
 
+static void take_and_interact(TM *tm, Loc loc, bool from_bty) {
+  Pair pair = take_pair(loc);
+
+  //bbag_maybe_empty(tm, prev_bpop);
+  if (from_bty && (tm->bpop == 0) && (tm->btid != tm->tid)) {
+    // The last pair was just popped from a stolen booty bag
+    bbag_set(tm->btid, EMPTY, memory_order_relaxed);
+  }
+  
+  interact(tm, pair_neg(pair), pair_pos(pair));
+}
+
 static void* thread_func(void* arg) {
   thread_id = (u64)arg;
   TM *tm = tms[thread_id];
@@ -1489,38 +1510,51 @@ static void* thread_func(void* arg) {
   // TODO: this could be a global net flag i think.
   tm->buse = true;
 
-  //sync_threads();
-
   u32  tick = 0;
   bool busy = tm->tid == 0;
   while (true) {
     tick += 1;
     bool bty = tm->bpop > 0; // haxor
+    // TODO: I think i can adjust this to not include RBAG, and thus pass
+    // down the "loc < BBAG_LEN" logic to determine if this was a boot-bag
+    // pop. that might transfer some tid vs. btid computation here though.
     Loc loc = rbag_pop(tm);
     if (loc) {
       busy = set_busy(busy);
 
-      Pair pair = take_pair(loc);
-
-      //bbag_maybe_empty(tm, prev_bpop);
-
-      if (bty) {
-        if (tm->bpop == 0) {
-          if (tm->btid != tm->tid) {
-            // Mark stolen booty bag empty
-            bbag_set(tm->btid, EMPTY, memory_order_relaxed);
-          }
+      // Check if our booty bag has been emptied by whoever stole it
+      if (tm->bput == BBAG_LEN) {
+        // Booty bag was full last we checked, but maybe it's empty now
+        if (bbag_get(tm->tid) == EMPTY) {
+          tm->bput = 0;
         }
       }
-      interact(tm, pair_neg(pair), pair_pos(pair));
+
+      take_and_interact(tm, loc, bty);
+
+      // Possible conditions:
+      // 1. booty bag wasn't full before, but was filled during interaction.
+      // 2. booty bag was full before, we stole our own bag, and re-filled it.
+      // 3. booty bag was full before, was stolen, emptied and released, and
+      //    we re-gained owernship and refilled, all during interaction.
+      //    (seems unlikely, but theoretically possible).
+      if (tm->bfld) {
+        if (tm->bput == BBAG_LEN) {
+          // Booty bag is full, and was filled by the preceding interaction
+          bbag_set(tm->tid, FULL, memory_order_release);
+          //if (!bbag_compare_swap(tm->tid, EMPTY, FULL, memory_order_release)) {
+          //  fprintf(stderr, "OOPS\n");
+          //}
+        }
+        tm->bfld = false;
+      }
     } else {
       busy = set_idle(busy);
-
-      if (try_steal(tm)) continue;
-
-      sched_yield();
-
-      if (check_timeout(tick)) break;
+      if (!try_steal(tm)) {
+        sched_yield();
+        if (timeout(tick))
+          break;
+      }
     }
   }
 
