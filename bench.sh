@@ -35,8 +35,8 @@ for (( i=1; i<=$num_iters; i++ )); do
         first_itrs="$itrs"
     elif [ "$first_itrs" -ne "$itrs" ]; then
         echo "ERROR: ITRS: $itrs mismatch with first ITRS: $first_itrs"
-        #echo "Output:"
-        #echo "$output"
+        echo "Output:"
+        echo "$output"
         #exit 1
     fi
 
