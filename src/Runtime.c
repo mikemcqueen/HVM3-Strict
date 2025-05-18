@@ -213,6 +213,7 @@ typedef struct BB {
 static TM *tms[TPC];
 static BB *bbs[TPC];
 static thread_t threads[TPC];
+static uint8_t unprocessed_itrs[255] = { 0 };
 
 static _Thread_local int thread_id = 0;
 
@@ -227,7 +228,7 @@ void dump_buff(TM *tm);
 static const char* term_str(char* buf, Term term);
 Tag term_tag(Term term) { return term & 0xFF; }
 
-//#define MEMLOG // comment out to disable
+#define MEMLOG // comment out to disable
 
 #ifdef MEMLOG
 
@@ -1371,6 +1372,8 @@ static void interact(TM *tm, Term neg, Term pos) {
   Loc neg_loc = term_loc(neg);
   Loc pos_loc = term_loc(pos);
 
+  bool processed = true;
+
   switch (neg_tag) {
   case APP:
     switch (pos_tag) {
@@ -1389,12 +1392,13 @@ static void interact(TM *tm, Term neg, Term pos) {
     case SUP:
       interact_appsup(tm, neg_loc, pos_loc);
       break;
+    default:
+      processed = false;
+      break;
     }
     break;
   case OPX:
     switch (pos_tag) {
-    case LAM:
-      break;
     case NUL:
       interact_opxnul(tm, neg_loc);
       break;
@@ -1409,12 +1413,14 @@ static void interact(TM *tm, Term neg, Term pos) {
     case SUP:
       interact_opxsup(tm, neg_loc, term_lab(neg), pos_loc);
       break;
+    case LAM:
+    default:
+      processed = false;
+      break;
     }
     break;
   case OPY:
     switch (pos_tag) {
-    case LAM:
-      break;
     case NUL:
       interact_opynul(tm, neg_loc);
       break;
@@ -1428,6 +1434,10 @@ static void interact(TM *tm, Term neg, Term pos) {
       break;
     case SUP:
       interact_opysup(tm, neg_loc, pos_loc);
+      break;
+    case LAM:
+    default:
+      processed = false;
       break;
     }
     break;
@@ -1452,12 +1462,13 @@ static void interact(TM *tm, Term neg, Term pos) {
     case SUP:
       interact_dupsup(tm, neg_loc, pos_loc);
       break;
+    default:
+      processed = false;
+      break;
     }
     break;
   case MAT:
     switch (pos_tag) {
-    case LAM:
-      break;
     case NUL:
       interact_matnul(tm, neg_loc, term_lab(neg));
       break;
@@ -1472,6 +1483,10 @@ static void interact(TM *tm, Term neg, Term pos) {
     case SUP:
       interact_matsup(tm, neg_loc, term_lab(neg), pos_loc);
       break;
+    case LAM:
+    default:
+      processed = false;
+      break;
     }
     break;
   case ERA:
@@ -1479,20 +1494,42 @@ static void interact(TM *tm, Term neg, Term pos) {
     case LAM:
       interact_eralam(tm, pos_loc);
       break;
-    case NUL:
-      break;
-    case U32:
-      break;
-    case REF:
-      break;
     case SUP:
       interact_erasup(tm, pos_loc);
       break;
+    case NUL:
+    case U32:
+    case REF:
+    default:
+      processed = false;
+      break;
     }
     break;
+  default:
+    processed = false;
+    break;
   }
-
   tm->itrs += 1;
+
+  if (!processed) {
+    unprocessed_itrs[neg_tag * 16 + pos_tag] = 1;
+  }
+}
+
+static void show_unprocessed_itrs() {
+  for (u32 i = 17; i <= 255; i++) {
+    u32 pos_tag = i % 16;
+    if (pos_tag < 1) continue;
+    u32 neg_tag = i / 16;
+    bool hdr = true;
+    if (unprocessed_itrs[neg_tag*16 + pos_tag]) {
+      if (hdr) {
+        fprintf(stderr, "Unprocesed itrs:\n");
+        hdr = false;
+      }
+      fprintf(stderr, "%s%s\n", tag_to_str(neg_tag), tag_to_str(pos_tag));
+    }
+  }
 }
 
 static inline bool sequential_step(TM* tm) {
@@ -1505,23 +1542,6 @@ static inline bool sequential_step(TM* tm) {
   Pair pair = take_pair(loc);
   interact(tm, pair_neg(pair), pair_pos(pair));
   return true;
-}
-
-// A simple spin-wait barrier using atomic operations
-a64 a_reached = 0; // number of threads that reached the current barrier
-a64 a_barrier = 0; // number of barriers passed during this program
-static void sync_threads() {
-  u64 barrier_old = atomic_load_explicit(&a_barrier, memory_order_relaxed);
-  if (atomic_fetch_add_explicit(&a_reached, 1, memory_order_relaxed) == (TPC - 1)) {
-    // Last thread to reach the barrier resets the counter and advances the barrier
-    atomic_store_explicit(&a_reached, 0, memory_order_relaxed);
-    atomic_store_explicit(&a_barrier, barrier_old + 1, memory_order_release);
-  } else {
-    u32 tries = 0;
-    while (atomic_load_explicit(&a_barrier, memory_order_acquire) == barrier_old) {
-      sched_yield();
-    }
-  }
 }
 
 static bool set_idle(bool was_busy) {
@@ -1649,6 +1669,8 @@ static void parallel_normalize() {
   for (u64 i = 0; i < TPC; i++) {
     thread_join(threads[i], NULL);
   }
+
+  show_unprocessed_itrs();
 }
 
 Term normalize(Term term) {
