@@ -184,13 +184,16 @@ typedef struct TM {
   u32 btid; // tid from which bbag was stolen
   u32 sgud; // successful steals
   u32 sbad; // failed steals
+
+  // debugging
+  u32 mput;
+  u32 itid;
+  u32 i1_tag;
+  u32 i2_tag;
+
   u64 itrs; // interaction count
   bool buse; // use booty bag
   bool muse; // use mlog
-  u32 mput;
-  #if 0
-  u32 mbuf[MBUF_SIZ];
-  #endif
 } TM;
 
 //static_assert(sizeof(TM) <= CACH_SIZ, "TM struct getting big");
@@ -222,8 +225,9 @@ void dump_buff(TM *tm);
 #define TERMSTR_BUFSIZ 128
 
 static const char* term_str(char* buf, Term term);
+Tag term_tag(Term term) { return term & 0xFF; }
 
-//#define MEMLOG // comment out to disable
+#define MEMLOG // comment out to disable
 
 #ifdef MEMLOG
 
@@ -236,13 +240,13 @@ static const char* term_str(char* buf, Term term);
 static u64 *MEMBUFF = NULL;
 //static a64 MLOG_END = 0;
 enum : u32 {
-  MLOG_SIZ = (1U << 28) * sizeof(u64),
+  MLOG_SIZ = (1U << 26) * sizeof(u64),
   MLOG_LEN = MLOG_SIZ / (TPC * sizeof(u64))
 };
 
 //static _Thread_local u64 rbag_loc = 0;
-#define MLOG(mop, loc, t1, t2)          mlog((u32)thread_id, mop, 0, loc, t1, t2, 0)
-#define MLOG_LVL(mop, loc, lvl, t1, t2) mlog((u32)thread_id, mop, 0, loc, t1, t2, lvl)
+#define MLOG(mop, loc, t1, t2)          mlog((u32)thread_id, mop, loc, t1, t2, 0)
+#define MLOG_LVL(mop, loc, lvl, t1, t2) mlog((u32)thread_id, mop, loc, t1, t2, lvl)
 #else
 #define MLOG(mop, loc, t1, t2)
 #define MLOG_LVL(mop, loc, lvl, t1, t2)
@@ -253,8 +257,6 @@ static void mlog_init() {
   if (MEMBUFF == NULL) {
     MEMBUFF = aligned_alloc(CACH_SIZ, MLOG_SIZ);
   }
-  //memset(MEMBUFF, 0, MLOG_MAX * sizeof(u32));
-  //MLOG_END = 0;
 }
 
 static void mlog_free() {
@@ -264,9 +266,13 @@ static void mlog_free() {
   }
 }
 
-// lvl: 5, op:3, loc: 7, tid: 4, sid: 4
-static u64 mlog_entry(u32 tid, u32 mop, u32 sid, u32 loc, u32 lvl) {
-  u64 hi = (lvl << 18) | ((mop & 0x7) << 15) | ((loc & 0x7F) << 8) | ((tid & 0xF) << 4) | (sid & 0xF);
+// i1_tag: 4, i2_tag: 4, lvl: 5, op:2, t1_tag: 4, t2_tag: 4, tid: 4, sid: 4
+static u64 mlog_entry(u32 tid, u32 mop, u32 sid, u32 loc, u32 lvl,
+                      u32 i1_tag, u32 i2_tag, u32 t1_tag, u32 t2_tag) {
+  u64 hi = (i1_tag << 27) | ((i2_tag & 0xF) << 23) |
+    ((lvl & 0x1F) << 18) | ((mop & 0x3) << 16) |
+    ((t1_tag & 0xF) << 12) | ((t2_tag & 0xF) << 8) |
+    ((tid & 0xF) << 4) | (sid & 0xF);
   return hi << 32 | loc;
 }
 
@@ -274,19 +280,29 @@ static u32 mlog_hi(u64 e) {
   return e >> 32;
 }
 
+static u32 mlog_i1_tag(u64 e) {
+  return (mlog_hi(e) >> 27);
+}
+
+static u32 mlog_i2_tag(u64 e) {
+  return (mlog_hi(e) >> 23) & 0xF;
+}
+
 static u32 mlog_lvl(u64 e) {
-  return mlog_hi(e) >> 18;
+  return (mlog_hi(e) >> 18) & 0x1F;
 }
 
 static u32 mlog_mop(u64 e) {
-  return (mlog_hi(e) >> 15) & 0x7;
+  return (mlog_hi(e) >> 16) & 0x3;
 }
 
-/*
-static u32 mlog_loc(u64 e) {
-  return (mlog_hi(e) >> 8) & 0x7F;
+static u32 mlog_t1_tag(u64 e) {
+  return (mlog_hi(e) >> 12) & 0xF;
 }
-*/
+
+static u32 mlog_t2_tag(u64 e) {
+  return (mlog_hi(e) >> 8) & 0xF;
+}
 
 static u32 mlog_tid(u64 e) {
   return (mlog_hi(e) >> 4) & 0xF;
@@ -330,9 +346,11 @@ static void mlog_dump(const char* fn) {
       char buf1[TERMSTR_BUFSIZ];
       char buf2[TERMSTR_BUFSIZ];
       */
-      fprintf(fp, "%" PRIu64 ",%u,%s,%u,%u\n", cnt, mlog_tid(e), mop_str(mlog_mop(e)),
-              /*mlog_sid(e),*/ mlog_lvl(e), mlog_loc(e));
-      //, term_str(buf1, t1), term_str(buf2, t2));
+      fprintf(fp, "%" PRIu64 ",%u,%s%s,%u,%s,%u,%s,%s,%u\n", cnt, mlog_tid(e),
+              tag_to_str(mlog_i1_tag(e)), tag_to_str(mlog_i2_tag(e)),
+              mlog_sid(e), mop_str(mlog_mop(e)), mlog_lvl(e),
+              tag_to_str(mlog_t1_tag(e)), tag_to_str(mlog_t2_tag(e)),
+              mlog_loc(e));
     }
   }
   fclose(fp);
@@ -353,7 +371,7 @@ __asm__(
 );
 #endif
 
-static void mlog(u32 tid, u32 mop, u32 sid, Loc loc, Term t1, Term t2, u32 lvl) {
+static void mlog(u32 tid, u32 mop, Loc loc, Term t1, Term t2, u32 lvl) {
   static bool at_end = false;
 
   TM *tm = tms[tid];
@@ -361,7 +379,8 @@ static void mlog(u32 tid, u32 mop, u32 sid, Loc loc, Term t1, Term t2, u32 lvl) 
     u32 pos = tid * MLOG_LEN + tm->mput;
 
     MEMBUFF[pos] = read_cntvct();
-    MEMBUFF[pos+1] = mlog_entry(tid, mop, sid, loc, lvl);
+    MEMBUFF[pos+1] = mlog_entry(tid, mop, tm->itid, loc, lvl, tm->i1_tag,
+                                tm->i2_tag, term_tag(t1), term_tag(t2));
 
     /*
     *(Term*)&MEMBUFF[end] = t1;
@@ -376,29 +395,6 @@ static void mlog(u32 tid, u32 mop, u32 sid, Loc loc, Term t1, Term t2, u32 lvl) 
   }
 }
 
-/*
-static void mlog_lvl(u32 tid, u32 mop, u32 sid, u32 lvl, Loc loc, Term t1, Term t2) {
-  static bool at_end = false;
-
-  // ugly but acceptable load-test-add pattern for debug logging.
-  u32 end = atomic_load(&MLOG_END);
-  if (end + 5 < MLOG_MAX) {
-    end = atomic_fetch_add(&MLOG_END, 5UL);
-    if (end < MLOG_MAX) {
-      MEMBUFF[end] = mlog_entry(tid, mop, sid, loc);
-      end += 1;
-      *(Term*)&MEMBUFF[end] = t1;
-      end += 2;
-      *(Term*)&MEMBUFF[end] = t2;
-      return;
-    }
-  }
-  if (!at_end) {
-    fprintf(stderr, "end of MLOG reached\n");
-    at_end = true;
-  }
-}
-*/
 #endif // MEMLOG
 
 void mlog_exit() {
@@ -487,8 +483,6 @@ static Term pair_neg(Pair pair) {
 Term term_new(Tag tag, Lab lab, Loc loc) {
   return ((Term)loc << 32) | ((Term)lab << 8) | tag;
 }
-
-Tag term_tag(Term term) { return term & 0xFF; }
 
 Lab term_lab(Term term) { return (term >> 8) & 0xFFFFFF; }
 
@@ -952,13 +946,6 @@ static Term expand_ref(TM *tm, Loc def_idx) {
     Pair pair = *(Pair*)&rbag[i];
     Loc loc = rbag_push(tm, term_offset_loc(pair_neg(pair), offset),
                         term_offset_loc(pair_pos(pair), offset));
-    #if 0
-    if (def_idx == 5) {
-      if (tm->mput < MBUF_SIZ) {
-        tm->mbuf[tm->mput++] = loc;
-      }
-    }
-    #endif
   }
 
   return root;
@@ -1752,8 +1739,6 @@ static void* thread_func(void* arg) {
   // TODO: this could be a global net flag i think.
   tm->buse = true;
 
-  //sync_threads();
-
   u32  tick = 0;
   bool busy = tm->tid == 0;
   while (true) {
@@ -1765,47 +1750,23 @@ static void* thread_func(void* arg) {
 
       Pair pair = take_pair(loc);
 
-      //bbag_maybe_empty(tm, prev_bpop);
+      // Debugging
+      tm->i1_tag = term_tag(pair_neg(pair));
+      tm->i2_tag = term_tag(pair_pos(pair));
+      tm->itid = bty ? tm->btid : tm->tid;
 
-      if (bty) {
-        //MLOG(MOP_LOAD, tm->btid, tm->bpop, pair_neg(pair), pair_pos(pair));
-
-        if (1 && bty_debug) {
-          char buf[TERMSTR_BUFSIZ];
-          fprintf(stderr, "%u   %s\n", tm->tid, term_str(buf, pair_neg(pair)));
-          fprintf(stderr, "%u   %s\n", tm->tid, term_str(buf, pair_pos(pair)));
-        }
-
-        if (tm->bpop == 0) {
-          if (tm->btid != tm->tid) {
-            // Mark stolen booty bag empty
-            bbag_set(tm->btid, EMPTY, memory_order_relaxed);
-          
-            if (0 && bty_debug) {
-              fprintf(stderr, "%u finished popping from t%u's booty bag\n",
-                      tm->tid, tm->btid);
-            }
-          }
-          else {
-            if (0 && bty_debug) {
-              fprintf(stderr, "%u finished popping from own booty bag\n", tm->tid);
-            }
-          }
-        }
-      } else {
-        //MLOG(MOP_LOAD, tm->tid + 10, tm->rput, pair_neg(pair), pair_pos(pair));
+      if (bty && (tm->bpop == 0) && (tm->btid != tm->tid)) {
+        // Mark stolen booty bag empty
+        bbag_set(tm->btid, EMPTY, memory_order_relaxed);
       }
 
-      if (pair != 0) {
-        interact(tm, pair_neg(pair), pair_pos(pair));
-      }
+      interact(tm, pair_neg(pair), pair_pos(pair));
     } else {
       busy = set_idle(busy);
 
       if (try_steal(tm)) continue;
 
       sched_yield();
-      //usleep(1);
 
       if (check_timeout(tick)) break;
     }
@@ -1818,16 +1779,6 @@ static void* thread_func(void* arg) {
     fprintf(stderr, "t%u: %" PRIu64 " itrs, rput: %u, bput: %u, bpop: %u, steals: %u good %u bad\n",
             tm->tid, tm->itrs, tm->rput, tm->bput, tm->bpop, tm->sgud, tm->sbad);
   }
-
-  //if (thd_debug) {
-  //  fprintf(stderr, "%u before sync...\n", tm->tid);
-  //}
-
-  // sync_threads();
-
-  //if (thd_debug) {
-  //  fprintf(stderr, "%u after sync done\n", tm->tid);
-  //}
 
   return NULL;
 }
