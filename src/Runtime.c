@@ -15,7 +15,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#define DEBUG
+//#define DEBUG
 
 #define DEBUG_LOG(fmt, ...) fprintf(stderr, "[DEBUG] " fmt "\n", ##__VA_ARGS__)
 
@@ -201,14 +201,14 @@ static Book BOOK = {
 
 // Local Thread Memory
 typedef struct TM {
-  u32 tid;  // thread id
-  Loc nput; // next node allocation attempt index
-  Loc rput; // next rbag push index
-  Loc bput; // next (owned) bbag push index
-  Loc bpop; // next (stolen) bbag pop index
-  u32 sid; // tid from which bbag was stolen
-  u32 sgud; // successful steals
-  u32 sbad; // failed steals
+  u32 tid;   // thread id
+  Loc nput;  // next node allocation attempt index
+  Loc rput;  // next rbag push index
+  Loc bput;  // owned) bbag push index
+  u32 sid;   // tid from which bbag was stolen
+  Loc spop;  // stolen bbag pop index + 2
+  u32 sgud;  // successful steal count
+  u32 sbad;  // failed steal count
 
   // debugging
   u32 mput;
@@ -216,7 +216,7 @@ typedef struct TM {
   u32 i1_tag;
   u32 i2_tag;
 
-  u64 itrs; // interaction count
+  u64 itrs;  // interaction count
   bool buse; // use booty bag
   bool bful; 
 } TM;
@@ -450,7 +450,7 @@ TM *tm_new(u64 tid) {
   tm_reset(tm);
   tm->tid = tid;
   tm->bput = 0;
-  tm->bpop = 0;
+  tm->spop = 0;
   tm->sid = TPC;
   tm->sgud = 0;
   tm->sbad = 0;
@@ -530,7 +530,7 @@ static Term term_offset_loc(Term term, Loc offset) {
 
 static int mop_debug = 0; // memory operations
 static int thd_debug = 0; // threading
-static int bty_debug = 0; // booty bag
+static int bty_debug = 1; // booty bag
 
 static const char* term_str(char* buf, Term term) {
   sprintf(buf, "%s lab:%u loc:%u", tag_to_str(term_tag(term)),
@@ -635,6 +635,7 @@ static Loc node_alloc(TM *tm, u32 cnt) {
   if (tm->nput + cnt >= NODE_LEN) {
     fprintf(stderr, "%u node space exhausted, nput: %u, cnt: %u, LEN: %u\n",
             tm->tid, tm->nput, cnt, NODE_LEN);
+    //fflush(stderr);
     exit(1);
   }
 
@@ -660,8 +661,18 @@ static u32 bbag_get(u32 tid) {
 static Loc get_push_offset(TM *tm) {
   // Only push to booty bag if we aren't stealing
   if (tm->buse && !tm->bful && (tm->bput < BBAG_LEN) && (tm->sid == TPC)) {
+
+#ifdef DEBUG
+  fprintf(stderr, "%u pushing to booty bag @ %u\n", tm->tid, tm->bput);
+#endif
+
     return tm->bput;
   }
+
+#ifdef DEBUG
+  fprintf(stderr, "%u pushing to RBAG @ %u\n", tm->tid, tm->rput);
+#endif
+
   // Push to RBAG
   return BBAG_LEN + tm->rput;
 }
@@ -689,15 +700,15 @@ static void rbag_push(TM *tm, Term neg, Term pos) {
 }
 
 static Pair rbag_pop(TM* tm) {
-  if (tm->bpop > 0) {
+  if (tm->spop > 0) {
     // Pop from stolen, non-empty booty bag
-    tm->bpop -= 2;
+    tm->spop -= 2;
 
     // If we are stealing from our own booty bag, adjust push index as well
     if (tm->sid == tm->tid) {
       tm->bput -= 2;
     }
-    return bbag_ini(tm->sid) + tm->bpop;
+    return bbag_ini(tm->sid) + tm->spop;
   } else if (tm->rput > 0) {
     // Pop from non-empty RBAG
     tm->rput -= 2;
@@ -1663,16 +1674,24 @@ static bool try_steal(TM *tm) {
     // TODO: combine these two conditions into one compound condition
     if (tm->bput < BBAG_LEN) {
       // Booty bag isn't full, so we can steal without atomics
-      tm->bpop = tm->bput;
+      tm->spop = tm->bput;
       tm->sid = tm->tid;
+
+#ifdef DEBUG
+      fprintf(stderr, "%u stealing own non-empty booty bag\n", tm->tid);
+#endif
 
       return true;
     } else {
       // To steal from our own full bag, we need to atomic swap
       if (bbag_compare_swap(tm->tid, FULL, EMPTY, memory_order_relaxed)) {
-        tm->bpop = tm->bput; // will always be BBAG_LEN
-        tm->sid = tm->tid;
         tm->bful = false;
+        tm->spop = tm->bput; // will always be BBAG_LEN
+        tm->sid = tm->tid;
+
+#ifdef DEBUG
+        fprintf(stderr, "%u stole own full booty bag\n", tm->tid);
+#endif
 
         return true;
       }
@@ -1683,9 +1702,14 @@ static bool try_steal(TM *tm) {
   // Try to steal another thread's full bag
   u32 vic = get_victim(tm);
   if (bbag_compare_swap(vic, FULL, STOLEN, memory_order_acquire)) {
-    tm->bpop = BBAG_LEN;
+    tm->spop = BBAG_LEN;
     tm->sid = vic;
     tm->sgud += 1;
+
+#ifdef DEBUG
+    fprintf(stderr, "%u stole t%u's booty bag\n", tm->tid, tm->sid);
+#endif
+
     return true;
   }
 
@@ -1706,13 +1730,26 @@ static bool timeout(u32 tick) {
 static void take_and_interact(TM *tm, Loc loc, bool from_bty) {
   Pair pair = take_pair(loc, from_bty);
 
-  if (from_bty && (tm->bpop == 0) && (tm->sid != tm->tid)) {
-    // The last pair was just popped from a stolen booty bag
-    bbag_set(tm->sid, EMPTY, memory_order_relaxed);
+  if (from_bty && (tm->spop == 0)) {
+    // The booty bag we stole just became empty
+
+    if (tm->sid != tm->tid) {
+      // It was another threads bag - signal that it can be recovered now
+      bbag_set(tm->sid, EMPTY, memory_order_relaxed);
+
+#ifdef DEBUG
+      fprintf(stderr, "%u emptied t%u's stolen booty bag\n", tm->tid, tm->sid);
+#endif
+    } else {
+#ifdef DEBUG
+      fprintf(stderr, "%u emptied own stolen booty bag\n", tm->tid);
+#endif
+    }
+
+    // No longer stealing
     tm->sid = TPC;
-    tm->bful = false;
   }
-  
+
   interact(tm, pair_neg(pair), pair_pos(pair));
 }
 
@@ -1729,7 +1766,7 @@ static void* thread_func(void* arg) {
   while (true) {
     tick += 1;
 
-    bool from_bty = tm->bpop > 0; // haxor
+    bool from_bty = tm->spop > 0; // haxor
     // TODO: I think i can adjust rbag_pop() to not include RBAG, and thus pass
     // down the "loc < BBAG_LEN" logic to here in order to determine if this
     // was a booty-bag pop. That'll move some tid vs. sid logic here though.
@@ -1739,17 +1776,22 @@ static void* thread_func(void* arg) {
 
       // We *think* booty bag is full, but it may have been stolen and emptied
       if (tm->bful && (bbag_get(tm->tid) == EMPTY)) {
-        tm->bput = 0;
-        tm->sid = TPC;
         tm->bful = false;
+        tm->bput = 0;
+
+#ifdef DEBUG
+        fprintf(stderr, "%u recovered stolen, empty booty bag\n", tm->tid);
+#endif
+        //tm->sid = TPC;
       }
 
       take_and_interact(tm, loc, from_bty);
 
       if (!tm->bful && (tm->bput == BBAG_LEN)) {
         // Booty bag was filled by the preceding interaction
+
+        // Signal that it can be stolen aka drop()
         bbag_set(tm->tid, FULL, memory_order_release);
-        tm->sid = TPC; // weird
         tm->bful = true;
       }
     } else {
@@ -1766,8 +1808,8 @@ static void* thread_func(void* arg) {
   atomic_fetch_add(&net.itrs, tm->itrs);
 
   if (1) {
-    fprintf(stderr, "t%u: %" PRIu64 " itrs, rput: %u, bput: %u, bpop: %u, steals: %u good %u bad\n",
-            tm->tid, tm->itrs, tm->rput, tm->bput, tm->bpop, tm->sgud, tm->sbad);
+    fprintf(stderr, "t%u: %" PRIu64 " itrs, rput: %u, bput: %u, spop: %u, steals: %u good %u bad\n",
+            tm->tid, tm->itrs, tm->rput, tm->bput, tm->spop, tm->sgud, tm->sbad);
   }
   return NULL;
 }
