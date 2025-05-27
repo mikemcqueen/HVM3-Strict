@@ -66,14 +66,14 @@ void segv_handler(int sig) {
 #define OP_MUL 0x02
 #define OP_DIV 0x03
 #define OP_MOD 0x04
-#define OP_EQ 0x05
-#define OP_NE 0x06
-#define OP_LT 0x07
-#define OP_GT 0x08
+#define OP_EQ  0x05
+#define OP_NE  0x06
+#define OP_LT  0x07
+#define OP_GT  0x08
 #define OP_LTE 0x09
 #define OP_GTE 0x0A
 #define OP_AND 0x0B
-#define OP_OR 0x0C
+#define OP_OR  0x0C
 #define OP_XOR 0x0D
 #define OP_LSH 0x0E
 #define OP_RSH 0x0F
@@ -142,12 +142,12 @@ enum : u32 {
   RBAG = ((HEAP_SIZE - RBAG_SIZE) / sizeof(u64)) & ~7U, // CACH_U64 - 1
 
   // Calculate RBAG_LEN and NODE_LEN: number of u64 elements *per thread*
-  // MUST be 16-byte aligned. 64-byte alignment might be preferable
+  // RBAG_LEN MUST be 16-byte aligned. 64-byte alignment might be preferable
   RBAG_LEN = (RBAG_SIZE / (TPC * sizeof(u64))) & ~7U, // CACH_U64 - 1
   NODE_LEN = (HEAP_SIZE - RBAG_SIZE) / (TPC * sizeof(u64)),
 
   // Booty-bag length in u64 elements
-  BBAG_LEN = 8
+  BBAG_LEN = 96
 };
 
 typedef struct Net {
@@ -184,22 +184,30 @@ static Book BOOK = {
   .cap = 0,
 };
 
+#define MBUF_SIZ 10
+
 // Local Thread Memory
 typedef struct TM {
-  u32 tid;   // thread id
-  Loc nput;  // next node allocation attempt index
-  Loc rput;  // next rbag push index
-  Loc bput;  // next (owned) bbag push index
-  Loc bpop;  // next (stolen) bbag pop index + 2
-  u32 btid;  // tid from which bbag was stolen
-  u32 sgud;  // successful steal count
-  u32 sbad;  // failed steal count
-  u64 itrs;  // interaction count
+  u32 tid;  // thread id
+  Loc nput; // next node allocation attempt index
+  Loc rput; // next rbag push index
+  Loc bput; // next (owned) bbag push index
+  Loc bpop; // next (stolen) bbag pop index
+  u32 btid; // tid from which bbag was stolen
+  u32 sgud; // successful steals
+  u32 sbad; // failed steals
+
+  // debugging
+  u32 mput;
+  u32 itid;
+  u32 i1_tag;
+  u32 i2_tag;
+
+  u64 itrs; // interaction count
   bool buse; // use booty bag
-  bool bfld; // bbag was filled during current interaction
 } TM;
 
-static_assert(sizeof(TM) <= CACH_SIZ, "TM struct getting big");
+//static_assert(sizeof(TM) <= CACH_SIZ, "TM struct getting big");
 
 // Booty bag control word values
 enum : u32 {
@@ -215,6 +223,7 @@ typedef struct BB {
 static TM *tms[TPC];
 static BB *bbs[TPC];
 static thread_t threads[TPC];
+static uint8_t unprocessed_itrs[255] = { 0 };
 
 static _Thread_local int thread_id = 0;
 
@@ -226,13 +235,219 @@ void dump_buff();
 
 #define TERMSTR_BUFSIZ 128
 
+static Term pair_pos(Pair pair);
+static Term pair_neg(Pair pair);
 static const char* term_str(char* buf, Term term);
+Tag term_tag(Term term) { return term & 0xFF; }
+Loc term_loc(Term term);
+
+//#define MEMLOG // comment out to disable
+//#define LOCLOG
+
+#if defined(MEMLOG) && defined(LOCLOG)
+#error "define MEMLOG -or- LOCLOG not both"
+#endif
+
+#ifdef MEMLOG
+
+// Memory operations log
+static u64 *MEMBUFF = NULL;
+enum : u32 {
+  MLOG_SIZ = (1U << 26) * sizeof(u64) * 3,
+  MLOG_LEN = MLOG_SIZ / (TPC * sizeof(u64))
+};
+
+//static _Thread_local u64 rbag_loc = 0;
+#define MLOG(mop, loc, t1, t2)          mlog((u32)thread_id, mop, loc, t1, t2, 0, false)
+#define MLOG_PAIR(mop, loc, pair, lvl)  mlog((u32)thread_id, mop, loc, pair_neg(pair), pair_pos(pair), lvl, true)
+#define MLOG_LVL(mop, loc, lvl, t1, t2) mlog((u32)thread_id, mop, loc, t1, t2, lvl, false)
+#else
+#define MLOG(mop, loc, t1, t2)
+#define MLOG_PAIR(mop, loc, pair, lvl)
+#define MLOG_LVL(mop, loc, lvl, t1, t2)
+#endif
+
+// Memory operations
+#define MOP_EXCH 0x01
+#define MOP_LOAD 0x02
+#define MOP_STOR 0x03
+
+static const char* mop_str(u32 mop) {
+  switch (mop) {
+  case MOP_EXCH: return "EXCH";
+  case MOP_LOAD: return "LOAD";
+  case MOP_STOR: return "STOR";
+  default: return "????";
+  }
+}
+
+#ifdef MEMLOG
+static void mlog_init() {
+  if (MEMBUFF == NULL) {
+    MEMBUFF = aligned_alloc(CACH_SIZ, MLOG_SIZ);
+  }
+}
+
+static void mlog_free() {
+  if (MEMBUFF != NULL) {
+    free(MEMBUFF);
+    MEMBUFF = NULL;
+  }
+}
+
+// i1_tag: 4, i2_tag: 4, lvl: 5, op: 2, t1_tag: 4, t2_tag: 4, tid: 4, sid: 4
+
+static u64 mlog_entry(u32 tid, u32 mop, u32 sid, u32 loc, u32 lvl,
+                      u32 i1_tag, u32 i2_tag, u32 t1_tag, u32 t2_tag) {
+  u64 hi = (i1_tag << 27) | ((i2_tag & 0xF) << 23) |
+    ((lvl & 0x1F) << 18) | ((mop & 0x3) << 16) |
+    ((t1_tag & 0xF) << 12) | ((t2_tag & 0xF) << 8) |
+    ((tid & 0xF) << 4) | (sid & 0xF);
+  return hi << 32 | loc;
+}
+
+static u32 mlog_hi(u64 e) {
+  return e >> 32;
+}
+
+static u32 mlog_lo(u64 e) {
+  return e & 0xFFFFFFFF;
+}
+
+static u32 mlog_i1_tag(u64 e) {
+  return (mlog_hi(e) >> 27);
+}
+
+static u32 mlog_i2_tag(u64 e) {
+  return (mlog_hi(e) >> 23) & 0xF;
+}
+
+static u32 mlog_lvl(u64 e) {
+  return (mlog_hi(e) >> 18) & 0x1F;
+}
+
+static u32 mlog_mop(u64 e) {
+  return (mlog_hi(e) >> 16) & 0x3;
+}
+
+static u32 mlog_t1_tag(u64 e) {
+  return (mlog_hi(e) >> 12) & 0xF;
+}
+
+static u32 mlog_t2_tag(u64 e) {
+  return (mlog_hi(e) >> 8) & 0xF;
+}
+
+static u32 mlog_tid(u64 e) {
+  return (mlog_hi(e) >> 4) & 0xF;
+}
+
+static u32 mlog_sid(u64 e) {
+  return mlog_hi(e) & 0xF;
+}
+
+static u32 mlog_loc(u64 e) {
+  return mlog_lo(e);
+}
+
+static void mlog_dump_term(FILE* fp, u64 cnt, u64 e, u32 tag, Loc loc, u32 loc_offset) {
+  fprintf(fp, "%" PRIu64 ",%u,%s%s,%s,%u,%s,%u,%u\n", cnt, mlog_tid(e),
+          tag_to_str(mlog_i1_tag(e)), tag_to_str(mlog_i2_tag(e)),
+          mop_str(mlog_mop(e)), mlog_lvl(e),
+          tag_to_str(tag), loc, mlog_loc(e) + loc_offset);
+}
+
+static void mlog_dump(const char* fn) {
+  FILE *fp = fopen(fn, "w");
+  if (fp == NULL) {
+    perror("mlog_dump: Error opening file");
+    return;
+  }
+
+  u32 ops = 0;
+  for (u64 t = 0; t < TPC; t++) {
+    TM *tm = tms[t];
+    for (u32 i = 0; i < tm->mput; i += 3) {
+      u32 pos = t * MLOG_LEN + i;
+      u64 cnt =  MEMBUFF[pos]; 
+      u64 e =    MEMBUFF[pos+1]; // entry
+      u64 locs = MEMBUFF[pos+2]; // locs
+      u32 mop = mlog_mop(e);
+      if ((mop == MOP_LOAD) || (mop == MOP_STOR)) {
+        // T1 
+        Loc t1_loc = mlog_hi(locs);
+        mlog_dump_term(fp, cnt, e, mlog_t1_tag(e), t1_loc, 0);
+        Loc t2_loc = mlog_lo(locs);
+        if ((mlog_t2_tag(e) != 0) || (t2_loc != 0)) {
+          // T2
+          mlog_dump_term(fp, cnt, e, mlog_t2_tag(e), t2_loc, 1);
+        }
+      } else {
+        fprintf(fp, "%" PRIu64 ",%u,%s%s,%s,%u,%s,%u,%s,%u,%u\n", cnt, mlog_tid(e),
+                tag_to_str(mlog_i1_tag(e)), tag_to_str(mlog_i2_tag(e)),
+                /*mlog_sid(e),*/ mop_str(mlog_mop(e)), mlog_lvl(e),
+                tag_to_str(mlog_t1_tag(e)), mlog_hi(locs),
+                tag_to_str(mlog_t2_tag(e)), mlog_lo(locs), mlog_loc(e));
+      }
+    }
+  }
+  fclose(fp);
+}
+
+#ifdef __APPLE__
+
+// Use explicit file-scope assembly to prevent compiler from optimizing out
+
+extern uint64_t read_cntvct(void);
+__asm__(
+    ".global _read_cntvct\n"
+    ".global read_cntvct\n"
+    "_read_cntvct:\n"
+    "read_cntvct:\n"
+    //"   isb\n"
+    "   mrs x0, cntvct_el0\n"
+    "   ret\n"
+);
+#endif
+
+static void mlog(u32 tid, u32 mop, Loc loc, Term t1, Term t2, u32 lvl, bool force_t2) {
+  static bool at_end = false;
+
+  TM *tm = tms[tid];
+  if (tm->mput + 3 < MLOG_LEN) {
+    u32 pos = tid * MLOG_LEN + tm->mput;
+
+    MEMBUFF[pos] = read_cntvct();
+    MEMBUFF[pos+1] = mlog_entry(tid, mop, tm->itid, loc, lvl, tm->i1_tag,
+                                tm->i2_tag, term_tag(t1), term_tag(t2));
+
+#if 1
+    MEMBUFF[pos+2] = (u64)term_loc(t1) << 32 | term_loc(t2);
+#endif
+
+    tm->mput += 3;
+  } else if (!at_end) {
+    fprintf(stderr, "%u end of MLOG reached\n", tid);
+    at_end = true;
+  }
+}
+
+#endif // MEMLOG
+
+void mlog_exit() {
+#ifdef MEMLOG
+  mlog_dump("memlog.txt");
+#endif
+  exit(1);
+}
 
 // TM/BS operations
 void tm_reset(TM *tm) {
   tm->rput = 0;
   tm->nput = 0;
   tm->itrs = 0;
+
+  tm->mput = 0;
 }
 
 TM *tm_new(u64 tid) {
@@ -252,6 +467,7 @@ TM *tm_new(u64 tid) {
   tm->sbad = 0;
   tm->buse = false;
   tm->bfld = false;
+
   return tm;
 }
 
@@ -304,8 +520,6 @@ Term term_new(Tag tag, Lab lab, Loc loc) {
   return ((Term)loc << 32) | ((Term)lab << 8) | tag;
 }
 
-Tag term_tag(Term term) { return term & 0xFF; }
-
 Lab term_lab(Term term) { return (term >> 8) & 0xFFFFFF; }
 
 Loc term_loc(Term term) { return (term >> 32) & 0xFFFFFFFF; }
@@ -337,89 +551,76 @@ static const char* term_str(char* buf, Term term) {
 }
 
 // Memory operations
+Term swap_lvl(Loc loc, Term term, u32 lvl) {
+  Term got = atomic_exchange_explicit((a64*)&BUFF[loc], term, memory_order_relaxed);
+  MLOG_LVL(MOP_EXCH, loc, lvl, got, term);
+  return got;
+}
+
+Term swap_seq_cst(Loc loc, Term term, u32 lvl) {
+  Term got = atomic_exchange_explicit((a64*)&BUFF[loc], term, memory_order_acquire);
+  MLOG_LVL(MOP_EXCH, loc, lvl, got, term);
+  return got;
+}
+
 Term swap(Loc loc, Term term) {
-  Term res = atomic_exchange_explicit((a64*)&BUFF[loc], term, memory_order_relaxed);
-
-#ifdef DEBUG
-  if (mop_debug)) {
-    char buf1[TERMSTR_BUFSIZ];
-    char buf2[TERMSTR_BUFSIZ];
-    fprintf(stderr, "%d swap %u %s with %s\n", thread_id, loc,
-        term_str(buf1, res), term_str(buf2, term));
-  }
-#endif
-
-  return res;
+  return swap_lvl(loc, term, 0);
 }
 
 Term get(Loc loc) {
   Term term = atomic_load_explicit((a64*)&BUFF[loc], memory_order_relaxed);
-
-#ifdef DEBUG
-  if (mop_debug) {
-    char buf[TERMSTR_BUFSIZ];
-    fprintf(stderr, "%d get %u %s\n", thread_id, loc, term_str(buf, term));
-  }
-#endif
-
+  MLOG(MOP_LOAD, loc, term, 0);
   return term;
 }
 
 Term take(Loc loc) {
   Term term = atomic_exchange_explicit((a64*)&BUFF[loc], VOID, memory_order_relaxed);
-
-#ifdef DEBUG
-  if (mop_debug) {
-    char buf[TERMSTR_BUFSIZ];
-    fprintf(stderr, "%d take %u %s\n", thread_id, loc, term_str(buf, term));
-  }
-#endif
-
+  MLOG(MOP_EXCH, loc, term, 0);
   return term;
+}
+
+void set_release(Loc loc, Term term) {
+  atomic_store_explicit((a64*)&BUFF[loc], term, memory_order_release);
+  MLOG(MOP_STOR, loc, term, 0);
 }
 
 void set(Loc loc, Term term) {
   atomic_store_explicit((a64*)&BUFF[loc], term, memory_order_relaxed);
-
-#ifdef DEBUG
-  if (mop_debug) {
-    char buf[TERMSTR_BUFSIZ];
-    fprintf(stderr, "%d set %u %s\n", thread_id, loc, term_str(buf, term));
-  }
-#endif
+  MLOG(MOP_STOR, loc, term, 0);
 }
 
-static Pair take_pair(Loc loc) {
+static Pair take_pair(Loc loc, bool bty) {
   Pair pair = *(Pair*)&BUFF[loc];
+  
+  // Debugging
+#if defined(MEMLOG)
+  Term neg = pair_neg(pair);
+  Term pos = pair_pos(pair);
 
+  TM *tm = tms[thread_id];
+  tm->i1_tag = term_tag(neg);
+  tm->i2_tag = term_tag(pos);
+  tm->itid = bty ? tm->btid : tm->tid;
+
+  MLOG_PAIR(MOP_LOAD, loc, pair, 0);
+
+#endif
+
+//#define VOID_TEST
 #ifdef VOID_TEST
+  *(Pair*)&BUFF[loc] = (Pair)VOID;
   if (pair == 0) {
     fprintf(stderr, "%d VOID pair taken\n", thread_id);
     exit(1);
   }
 #endif
   
-#if 0 || defined(DEBUG)
-  if (mop_debug) {
-    char buf[TERMSTR_BUFSIZ];
-    fprintf(stderr, "%d take.neg %u %s\n", thread_id, loc, term_str(buf, pair_neg(pair)));
-    fprintf(stderr, "%d take.pos %u %s\n", thread_id, loc + 1, term_str(buf, pair_pos(pair)));
-  }
-#endif
-
   return pair;
 }
 
 static void set_pair(Loc loc, Pair pair) {
   *((Pair*)&BUFF[loc]) = pair;
-
-#if 0 || defined(DEBUG)
-  if (mop_debug) {
-    char buf[TERMSTR_BUFSIZ];
-    fprintf(stderr, "%d set.neg %u %s\n", thread_id, loc, term_str(buf, pair_neg(pair)));
-    fprintf(stderr, "%d set.pos %u %s\n", thread_id, loc + 1, term_str(buf, pair_pos(pair)));
-  }
-#endif
+  MLOG_PAIR(MOP_STOR, loc, pair, 0);
 }
 
 static Loc port(u64 n, Loc loc) { return n + loc - 1; }
@@ -438,8 +639,6 @@ static Loc node_alloc(TM *tm, u32 cnt) {
             tm->nput);
   }
 #endif
-
-  //cnt += (cnt & 1);
 
   if (tm->nput + cnt >= NODE_LEN) {
     fprintf(stderr, "%u node space exhausted, nput: %u, cnt: %u, LEN: %u\n",
@@ -492,21 +691,16 @@ static void rbag_push(TM *tm, Term neg, Term pos) {
   bool bty = off < BBAG_LEN;
   Loc loc = RBAG + tm->tid * RBAG_LEN + off;
 
-#ifdef DEBUG
-  if (mop_debug) {
-    fprintf(stderr, "%u calling set_pair @ %u, rput %u\n", tm->tid, loc,
-            tm->rput);
-  }
-#endif
+  Pair pair = pair_new(neg, pos);
+  set_pair(loc, pair);
 
-  set_pair(loc, pair_new(neg, pos));
+  //log_pair_loc(MOP_STOR, pair, loc);
 
   if (bty) {
     tm->bput += 2;
     if (tm->bput == BBAG_LEN) {
       // Booty bag was filled during this interaction
       tm->bfld = true;
-      //bbag_set(tm->tid, FULL, memory_order_release);
     }
   } else {
     //#ifdef DEBUG
@@ -519,6 +713,7 @@ static void rbag_push(TM *tm, Term neg, Term pos) {
 
     tm->rput += 2;
   }
+  return loc;
 }
 
 static Pair rbag_pop(TM* tm) {
@@ -768,14 +963,6 @@ static Term expand_ref(TM *tm, Loc def_idx) {
   // offset calculation must occur before node_alloc() call
   // TODO: i think we can use the return value of node_alloc() here
   Loc offset = (tm->tid * NODE_LEN) + tm->nput - 1;
-
-#ifdef DEBUG
-  if (mop_debug) {
-    fprintf(stderr, "%u expand_ref %u nodes %u rbag %u offset %u\n", tm->tid,
-        def_idx, nodes_len, rbag_len, offset);
-  }
-#endif
-
   node_alloc(tm, nodes_len - 1);
 
   Term root = term_offset_loc(nodes[0], offset);
@@ -785,6 +972,7 @@ static Term expand_ref(TM *tm, Loc def_idx) {
     Loc loc = offset + n;
     Term term = term_offset_loc(nodes[n], offset);
     BUFF[loc] = term;
+    MLOG_LVL(MOP_STOR, loc, def_idx, term, 0);
   }
 
   for (u32 i = 0; i < rbag_len; i += 2) {
@@ -806,6 +994,7 @@ static void boot(Loc def_idx) {
 }
 
 // Atomic Linker
+
 static Term get_loop(Loc loc) {
   fprintf(stderr, "get_loop\n");
   // TOOD: tick/timeout
@@ -820,37 +1009,48 @@ static Term get_loop(Loc loc) {
 }
 
 static inline void move(TM *tm, Loc neg_loc, u64 pos);
+static inline void move_lvl(TM *tm, Loc neg_loc, Term pos, u32 lvl);
 
-static inline void link_terms(TM *tm, Term neg, Term pos) {
+static inline void link_lvl(TM *tm, Term neg, Term pos, u32 lvl) {
   if (term_tag(pos) == VAR) {
-    Term far = swap(term_loc(pos), neg);
+    Term far = swap_lvl(term_loc(pos), neg, lvl);
     if (far == 0) {
       far = get_loop(term_loc(pos + 1));
     }
     if (term_tag(far) != SUB) {
-      move(tm, term_loc(pos), far);
+      move_lvl(tm, term_loc(pos), far, lvl + 1);
     }
   } else {
     rbag_push(tm, neg, pos);
   }
 }
 
-static inline void move(TM *tm, Loc neg_loc, Term pos) {
-  Term neg = swap(neg_loc, pos);
+static inline void move_lvl(TM *tm, Loc neg_loc, Term pos, u32 lvl) {
+  Term neg = swap_lvl(neg_loc, pos, lvl);
   if (term_tag(neg) != SUB) {
     // No need to take() since we already swapped
-    //set(neg_loc, 0);
-    link_terms(tm, neg, pos);
+    link_lvl(tm, neg, pos, lvl + 1);
   }
 }
 
+static inline void link_terms(TM *tm, Term neg, Term pos) {
+  link_lvl(tm, neg, pos, 0);
+}
+
+static inline void move(TM *tm, Loc neg_loc, Term pos) {
+  move_lvl(tm, neg_loc, pos, 0);
+}
+
 // Interactions
-static void interact_applam(TM *tm, Loc a_loc, Loc b_loc) {
+static bool interact_applam(TM *tm, Loc a_loc, Loc b_loc) {
+  return true;
+
   Term arg = take(port(1, a_loc));
   Loc ret = port(2, a_loc);
   Loc var = port(1, b_loc);
   Term bod = take(port(2, b_loc));
 
+  // Magic to make race condition appear more frequently
   bool buse = tm->buse;
   tm->buse = false;
 
@@ -858,6 +1058,7 @@ static void interact_applam(TM *tm, Loc a_loc, Loc b_loc) {
   move(tm, ret, bod);
 
   tm->buse = buse;
+  return true;
 }
 
 static void interact_appsup(TM *tm, Loc a_loc, Loc b_loc) {
@@ -1311,6 +1512,10 @@ static void interact(TM *tm, Term neg, Term pos) {
   Loc neg_loc = term_loc(neg);
   Loc pos_loc = term_loc(pos);
 
+  fprintf(stderr, "%s%s\n", tag_to_str(neg_tag), tag_to_str(pos_tag));
+
+  bool processed = true;
+
   switch (neg_tag) {
   case APP:
     switch (pos_tag) {
@@ -1329,12 +1534,13 @@ static void interact(TM *tm, Term neg, Term pos) {
     case SUP:
       interact_appsup(tm, neg_loc, pos_loc);
       break;
+    default:
+      processed = false;
+      break;
     }
     break;
   case OPX:
     switch (pos_tag) {
-    case LAM:
-      break;
     case NUL:
       interact_opxnul(tm, neg_loc);
       break;
@@ -1349,12 +1555,14 @@ static void interact(TM *tm, Term neg, Term pos) {
     case SUP:
       interact_opxsup(tm, neg_loc, term_lab(neg), pos_loc);
       break;
+    case LAM:
+    default:
+      processed = false;
+      break;
     }
     break;
   case OPY:
     switch (pos_tag) {
-    case LAM:
-      break;
     case NUL:
       interact_opynul(tm, neg_loc);
       break;
@@ -1368,6 +1576,10 @@ static void interact(TM *tm, Term neg, Term pos) {
       break;
     case SUP:
       interact_opysup(tm, neg_loc, pos_loc);
+      break;
+    case LAM:
+    default:
+      processed = false;
       break;
     }
     break;
@@ -1392,12 +1604,13 @@ static void interact(TM *tm, Term neg, Term pos) {
     case SUP:
       interact_dupsup(tm, neg_loc, pos_loc);
       break;
+    default:
+      processed = false;
+      break;
     }
     break;
   case MAT:
     switch (pos_tag) {
-    case LAM:
-      break;
     case NUL:
       interact_matnul(tm, neg_loc, term_lab(neg));
       break;
@@ -1412,6 +1625,10 @@ static void interact(TM *tm, Term neg, Term pos) {
     case SUP:
       interact_matsup(tm, neg_loc, term_lab(neg), pos_loc);
       break;
+    case LAM:
+    default:
+      processed = false;
+      break;
     }
     break;
   case ERA:
@@ -1419,20 +1636,42 @@ static void interact(TM *tm, Term neg, Term pos) {
     case LAM:
       interact_eralam(tm, pos_loc);
       break;
-    case NUL:
-      break;
-    case U32:
-      break;
-    case REF:
-      break;
     case SUP:
       interact_erasup(tm, pos_loc);
       break;
+    case NUL:
+    case U32:
+    case REF:
+    default:
+      processed = false;
+      break;
     }
     break;
+  default:
+    processed = false;
+    break;
   }
-
   tm->itrs += 1;
+
+  if (!processed) {
+    unprocessed_itrs[neg_tag * 16 + pos_tag] = 1;
+  }
+}
+
+static void show_unprocessed_itrs() {
+  for (u32 i = 17; i <= 255; i++) {
+    u32 pos_tag = i % 16;
+    if (pos_tag < 1) continue;
+    u32 neg_tag = i / 16;
+    bool hdr = true;
+    if (unprocessed_itrs[neg_tag*16 + pos_tag]) {
+      if (hdr) {
+        fprintf(stderr, "Unprocesed itrs:\n");
+        hdr = false;
+      }
+      fprintf(stderr, "%s%s\n", tag_to_str(neg_tag), tag_to_str(pos_tag));
+    }
+  }
 }
 
 static inline bool sequential_step(TM* tm) {
@@ -1442,7 +1681,7 @@ static inline bool sequential_step(TM* tm) {
     return false;
   }
 
-  Pair pair = take_pair(loc);
+  Pair pair = take_pair(loc, false);
   interact(tm, pair_neg(pair), pair_pos(pair));
   return true;
 }
@@ -1513,7 +1752,7 @@ static bool timeout(u32 tick) {
 }
 
 static void take_and_interact(TM *tm, Loc loc, bool from_bty) {
-  Pair pair = take_pair(loc);
+  Pair pair = take_pair(loc, from_bty);
 
   if (from_bty && (tm->bpop == 0) && (tm->btid != tm->tid)) {
     // The last pair was just popped from a stolen booty bag
@@ -1589,6 +1828,8 @@ static void parallel_normalize() {
   for (u64 i = 0; i < TPC; i++) {
     thread_join(threads[i], NULL);
   }
+
+  show_unprocessed_itrs();
 }
 
 Term normalize(Term term) {
@@ -1608,6 +1849,8 @@ Term normalize(Term term) {
   } else {
     parallel_normalize();
   }
+
+  //  mlog_dump("memlog.good");
 
   return get(0);
 }
