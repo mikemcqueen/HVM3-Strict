@@ -1086,7 +1086,6 @@ static inline void move(TM *tm, Loc neg_loc, Term pos) {
 
 // Interactions
 static bool interact_applam(TM *tm, Loc a_loc, Loc b_loc) {
-  return true;
 
   Term arg = take(port(1, a_loc));
   Loc ret = port(2, a_loc);
@@ -1563,8 +1562,6 @@ static void interact(TM *tm, Term neg, Term pos) {
   Tag pos_tag = term_tag(pos);
   Loc neg_loc = term_loc(neg);
   Loc pos_loc = term_loc(pos);
-
-  fprintf(stderr, "%s%s\n", tag_to_str(neg_tag), tag_to_str(pos_tag));
 
   bool processed = true;
 
