@@ -160,7 +160,7 @@ enum : u32 {
   NODE_LEN = (HEAP_SIZE - RBAG_SIZE) / (TPC * sizeof(u64)),
 
   // Booty-bag length in u64 elements
-  BBAG_LEN = 96
+  BBAG_LEN = 8
 };
 
 typedef struct Net {
@@ -255,7 +255,7 @@ static const char* term_str(char* buf, Term term);
 Tag term_tag(Term term) { return term & 0xFF; }
 Loc term_loc(Term term);
 
-//#define MEMLOG // comment out to disable
+#define MEMLOG // comment out to disable
 
 #ifdef MEMLOG
 // Memory operations log
@@ -962,7 +962,7 @@ static void boot(Loc def_idx) {
 // Atomic Linker
 
 static Term get_loop(Loc loc) {
-  //fprintf(stderr, "get_loop\n");
+  fprintf(stderr, "get_loop\n");
   // TOOD: tick/timeout
   while (1) {
     Term term = get(loc);
@@ -981,7 +981,7 @@ static inline void link_lvl(TM *tm, Term neg, Term pos, u32 lvl) {
   if (term_tag(pos) == VAR) {
     Term far = swap_lvl(term_loc(pos), neg, lvl);
     if (far == 0) {
-      //far = get_loop(term_loc(pos + 1));
+      far = get_loop(term_loc(pos + 1));
     }
     if (term_tag(far) != SUB) {
       move_lvl(tm, term_loc(pos), far, lvl + 1);
@@ -1016,7 +1016,7 @@ static bool interact_applam(TM *tm, Loc a_loc, Loc b_loc) {
 
   // Magic to make race condition appear more frequently
   bool buse = tm->buse;
-  //  tm->buse = false;
+  tm->buse = false;
 
   move(tm, var, arg);
   move(tm, ret, bod);
