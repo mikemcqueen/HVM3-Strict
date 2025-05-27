@@ -37,7 +37,7 @@ for (( i=1; i<=$num_iters; i++ )); do
         echo "ERROR: ITRS: $itrs mismatch with first ITRS: $first_itrs"
         echo "Output:"
         echo "$output"
-        #exit 1
+        exit 1
     fi
 
     if [ "$first_size" -eq 0 ]; then

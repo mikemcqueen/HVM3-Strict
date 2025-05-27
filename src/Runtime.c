@@ -1,9 +1,11 @@
 // HVM3-Strict Core: parallel, polarized, LAM/APP & DUP/SUP only
 
 #include <assert.h>
+#include <execinfo.h>
 #include <inttypes.h>
 #include <math.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -29,6 +31,16 @@ int thread_create(pthread_t *thread, const pthread_attr_t *attr,
 
 int thread_join(pthread_t thread, void **retval) {
   return pthread_join(thread, retval);
+}
+
+void segv_handler(int sig) {
+  void *array[10];
+  size_t size;
+  
+  size = backtrace(array, 10);
+  fprintf(stderr, "Error: signal %d:\n", sig);
+  backtrace_symbols_fd(array, size, STDERR_FILENO);
+  exit(1);
 }
 
 // Constants
@@ -135,7 +147,7 @@ enum : u32 {
   NODE_LEN = (HEAP_SIZE - RBAG_SIZE) / (TPC * sizeof(u64)),
 
   // Booty-bag length in u64 elements
-  BBAG_LEN = 96
+  BBAG_LEN = 8
 };
 
 typedef struct Net {
@@ -313,16 +325,6 @@ static Term term_offset_loc(Term term, Loc offset) {
   return term_with_loc(term, loc);
 }
 
-static Term term_offset_loc2(Term term, Loc offset) {
-  Tag tag = term_tag(term);
-  if (tag == SUB || tag == NUL || tag == ERA || tag == REF || tag == U32) {
-    return term;
-  } else {
-    Loc loc = term_loc(term) + offset;
-    return (((Term)loc) << 32) | (term & 0xFFFFFFFF);
-  }
-}
-
 //#define DEBUG
 static int mop_debug = 0; // memory operations
 static int thd_debug = 0; // threading
@@ -409,11 +411,7 @@ static Pair take_pair(Loc loc) {
 }
 
 static void set_pair(Loc loc, Pair pair) {
-#ifdef ATOMIC
-  __atomic_store_n((Pair*)&BUFF[loc], pair, __ATOMIC_RELAXED);
-#else
   *((Pair*)&BUFF[loc]) = pair;
-#endif
 
 #if 0 || defined(DEBUG)
   if (mop_debug) {
@@ -429,6 +427,10 @@ static Loc port(u64 n, Loc loc) { return n + loc - 1; }
 // Allocator
 // ---------
 
+static Loc rnod_ini(u32 tid) {
+  return tid * NODE_LEN;
+}
+
 static Loc node_alloc(TM *tm, u32 cnt) {
 #ifdef DEBUG
   if (mop_debug) {
@@ -437,9 +439,7 @@ static Loc node_alloc(TM *tm, u32 cnt) {
   }
 #endif
 
-  if ((cnt & 1) == 1) {
-    cnt += 1;
-  }
+  //cnt += (cnt & 1);
 
   if (tm->nput + cnt >= NODE_LEN) {
     fprintf(stderr, "%u node space exhausted, nput: %u, cnt: %u, LEN: %u\n",
@@ -447,7 +447,7 @@ static Loc node_alloc(TM *tm, u32 cnt) {
     exit(1);
   }
 
-  Loc loc = tm->tid * NODE_LEN + tm->nput;
+  Loc loc = rnod_ini(tm->tid) + tm->nput;
   tm->nput += cnt;
   return loc;
 }
@@ -482,18 +482,6 @@ static Loc get_push_offset(TM *tm) {
       // Booty bag isn't full, push to it
       return tm->bput;
     }
-    /*
-    else {
-      // Booty bag is full
-      if (0 && !tm->bfld) {
-        // It wasn't filled during this interaction
-        if (bbag_get(tm->tid) == EMPTY) {
-          tm->bput = 0;
-          return tm->bput;
-        }
-      }
-    }
-    */
   }
   // Push to RBAG
   return BBAG_LEN + tm->rput;
@@ -567,6 +555,8 @@ void hvm_init() {
 
   alloc_static_data();
 
+  signal(SIGSEGV, segv_handler);
+
   #if 0 
   fprintf(stderr, "HEAP_SIZE = %" PRIu64 "\n", HEAP_SIZE);
   fprintf(stderr, "RBAG_SIZE = %" PRIu64 "\n", RBAG_SIZE);
@@ -586,16 +576,9 @@ void hvm_free() {
 
 Loc ffi_alloc_node(u64 arity) {
   TM *tm = tms[0];
-#if 1
   Loc loc = tm->nput;
-  //if ((arity & 1) == 1) {
-  //  arity += 1;
-  //}
   tm->nput += arity;
   return loc;
-#else
-  return node_alloc(tm, arity);
-#endif
 }
 
 void ffi_rbag_push(Term neg, Term pos) {
@@ -606,18 +589,94 @@ u64 inc_itr() {
   return atomic_load(&net.itrs);
 } 
 
-Loc rbag_ini() {
+Loc ffi_rbag_ini() {
   // TODO
   return RBAG;
 }
 
-Loc rbag_end() {
+Loc ffi_rbag_end() {
   // TODO
   return RBAG;
 }
 
-Loc rnod_end() {
-  return net.nods;
+Loc ffi_rnod_end() {
+  return atomic_load(&net.nods);
+}
+
+static Loc bbag_offset(u32 tid) {
+  return tid * RBAG_LEN;
+}
+
+static Loc bbag_ini(u32 tid) {
+  return RBAG + bbag_offset(tid);
+}
+
+static Loc rbag_ini(u32 tid) {
+  return bbag_ini(tid) + BBAG_LEN;
+}
+
+static u64 align(u64 align, u64 val) {
+  return (val + align - 1) & ~(align - 1);
+}
+
+int cmp_u32(const void *a, const void *b) {
+  u32 aa = *(const u32*)a;
+  u32 bb = *(const u32*)b;
+  return (aa > bb) - (bb < aa);
+}
+
+u32 upr_bnd(Loc *locs, u32 cnt, Loc tgt) {
+  u32 lft = 0;
+  u32 rgt = cnt;
+  while (lft < rgt) {
+    u32 mid = lft + (rgt - lft) / 2;
+    if (locs[mid] > tgt) {
+      rgt = mid;
+    } else {
+      lft = mid + 1;
+    }
+  }
+  return lft;
+}
+
+u32 dup_bod(Term *src, Term *dst, u32 nsrc) {
+  Term lam = src[0];
+  if (term_tag(lam) != LAM) return 0;
+
+  Term arg = src[1];
+  // Don't know how to deal with this.
+  if (term_tag(arg) == MAT) return 0;
+
+  Term bod = src[2];
+  if (term_tag(bod) != VAR) return 0;
+  
+  Loc bod_loc = term_loc(bod);
+  // Another weird case I can't deal with.
+  if (bod_loc < 2) return 0;
+
+  Loc *locs = (Loc *)(dst + nsrc * 2);
+  *locs = bod_loc;
+  
+  u32 nloc = 1;
+
+  // Copy all terms, updating their locs, and duplicating terms at
+  // locations in locs array
+  for (u32 i = 0, loc_idx = 0; i < nsrc; i++) {
+    Term trm = src[i];
+    if (term_has_loc(trm)) {
+      Loc loc = term_loc(trm);
+      if (loc > *locs) {
+        loc += 1;
+      }
+      trm = term_with_loc(trm, loc);
+    }
+    dst[i + loc_idx] = trm;
+    if ((loc_idx < nloc) && (i == locs[loc_idx])) {
+      loc_idx += 1;
+      dst[i + loc_idx] = trm;
+    }
+  }
+  return nloc;
 }
 
 // Moves the global buffer and redex bag into a new def and resets
@@ -629,37 +688,59 @@ void def_new(char *name) {
     } else {
       BOOK.cap *= 2;
     }
-
     BOOK.defs = realloc(BOOK.defs, sizeof(Def) * BOOK.cap);
   }
 
   TM *tm = tms[0];
 
-  Loc rbag_end = tm->rput;
-  Loc rnod_end = tm->nput;
-  size_t rbag_siz = ((sizeof(Term) * rbag_end) + CACH_SIZ - 1) & ~(CACH_SIZ - 1);
-  size_t rnod_siz = ((sizeof(Term) * rnod_end) + CACH_SIZ - 1) & ~(CACH_SIZ - 1);
+  Loc rnod_cnt = tm->nput;
+  Loc rbag_cnt = tm->rput;
+
+  u32 node_ini = align(CACH_SIZ, rnod_cnt);
+  // assert((mnod_ini + rnod_cnt * 3) < RBAG);
+  Term *nodes = &BUFF[node_ini];
+
+  u32 ndup = dup_bod(BUFF, nodes, rnod_cnt);
+
+  if (ndup == 0) {
+    nodes = BUFF;
+  } else {
+    rnod_cnt += ndup;
+  }
+
+  u64 rbag_siz = align(CACH_SIZ, sizeof(Term) * rbag_cnt);
+  u64 rnod_siz = align(CACH_SIZ, sizeof(Term) * rnod_cnt);
 
   Def def = {
       .name = name,
       .nodes = aligned_alloc(CACH_SIZ, rnod_siz),
-      .nodes_len = rnod_end,
+      .nodes_len = rnod_cnt,
       .rbag = aligned_alloc(CACH_SIZ, rbag_siz),
-      .rbag_len = rbag_end,
+      .rbag_len = rbag_cnt,
   };
 
   if (def.nodes == NULL || def.rbag == NULL) {
     fprintf(stderr, "DEF memory allocation failed\n");
+    exit(1);
   }
 
-  u64 *rbag = BUFF + RBAG + BBAG_LEN;
+  Term *rbag = &BUFF[rbag_ini(0)];
 
-  memcpy(def.nodes, BUFF, sizeof(Term) * def.nodes_len);
+  memcpy(def.nodes, nodes, sizeof(Term) * def.nodes_len);
   memcpy(def.rbag, rbag, sizeof(Term) * def.rbag_len);
 
-  // printf("NEW DEF '%s':\n", def.name);
-  // dump_buff();
-  // printf("\n");
+#if 0
+  if (ndup) {
+    if (ndup) {
+      memcpy(BUFF, nodes, sizeof(Term) * def.nodes_len);
+      tm->nput = def.nodes_len;
+    }
+
+    printf("NEW DEF '%s':\n", def.name);
+    dump_buff();
+    printf("\n");
+  }
+#endif
 
   memset(BUFF, 0, sizeof(Term) * def.nodes_len);
   memset(rbag, 0, sizeof(Term) * def.rbag_len);
@@ -700,44 +781,16 @@ static Term expand_ref(TM *tm, Loc def_idx) {
   Term root = term_offset_loc(nodes[0], offset);
 
   // No redexes reference these nodes yet; safe to add without atomics
-#define NODE_128
-#ifndef NODE_128 // old
   for (u32 n = 1; n < nodes_len; n++) {
     Loc loc = offset + n;
     Term term = term_offset_loc(nodes[n], offset);
     BUFF[loc] = term;
   }
-#else
-  u32 n = 1;
-  for (; n + 1 < nodes_len; n += 2) {
-    Loc loc = offset + n;
-    // 128-bit load & store
-    Pair pair = *(Pair*)&nodes[n];
-    *(Pair*)&BUFF[loc] = pair_new(term_offset_loc(pair_neg(pair), offset),
-                                  term_offset_loc(pair_pos(pair), offset));
-  }
-  if (n < nodes_len) {
-    BUFF[offset + n] = term_offset_loc(nodes[n], offset);
-  }
-#endif
 
-#if 0
   for (u32 i = 0; i < rbag_len; i += 2) {
-#else
-  // reverse order
-  for (int i = rbag_len - 2; i >= 0; i -= 2) {
-#endif
-
-#ifndef NODE_128 // old
     Term neg = term_offset_loc(rbag[i], offset);
     Term pos = term_offset_loc(rbag[i + 1], offset);
     rbag_push(tm, neg, pos);
-#else
-    // 128-bit load
-    Pair pair = *(Pair*)&rbag[i];
-    rbag_push(tm, term_offset_loc(pair_neg(pair), offset),
-              term_offset_loc(pair_pos(pair), offset));
-#endif
   }
   return root;
 }
@@ -753,11 +806,27 @@ static void boot(Loc def_idx) {
 }
 
 // Atomic Linker
+static Term get_loop(Loc loc) {
+  fprintf(stderr, "get_loop\n");
+  // TOOD: tick/timeout
+  while (1) {
+    Term term = get(loc);
+    if (term == 0) {
+      sched_yield();
+    } else {
+      return term;
+    }
+  }
+}
+
 static inline void move(TM *tm, Loc neg_loc, u64 pos);
 
 static inline void link_terms(TM *tm, Term neg, Term pos) {
   if (term_tag(pos) == VAR) {
     Term far = swap(term_loc(pos), neg);
+    if (far == 0) {
+      far = get_loop(term_loc(pos + 1));
+    }
     if (term_tag(far) != SUB) {
       move(tm, term_loc(pos), far);
     }
@@ -781,8 +850,14 @@ static void interact_applam(TM *tm, Loc a_loc, Loc b_loc) {
   Loc ret = port(2, a_loc);
   Loc var = port(1, b_loc);
   Term bod = take(port(2, b_loc));
+
+  bool buse = tm->buse;
+  tm->buse = false;
+
   move(tm, var, arg);
   move(tm, ret, bod);
+
+  tm->buse = buse;
 }
 
 static void interact_appsup(TM *tm, Loc a_loc, Loc b_loc) {
@@ -1592,7 +1667,7 @@ static char *bty_ctrl_str(u32 ctrl) {
 
 static void dump_term(Loc loc) {
   Term term = get(loc);
-  printf("%06X %03X %03X %s\n", loc, term_loc(term), term_lab(term),
+  printf("%04u %03u %03u %s\n", loc, term_loc(term), term_lab(term),
       tag_to_str(term_tag(term)));
 }
 
@@ -1641,21 +1716,20 @@ static void dump_term(Loc loc) {
 void tm_dump_buff(TM *tm) {
   printf("------------------\n");
   printf("      NODES\n");
-  printf("ADDR   LOC LAB TAG\n");
+  printf("ADDR LOC LAB TAG\n");
   printf("------------------\n");
   for (Loc idx = 0; idx < tm->nput; idx++) {
-    Loc loc = tm->tid * NODE_LEN + idx;
-    dump_term(loc);
+    dump_term(rnod_ini(tm->tid) + idx);
   }
   printf("------------------\n");
   printf("    REDEX BAG\n");
   printf("ADDR   LOC LAB TAG\n");
   printf("------------------\n");
   for (Loc idx = 0; idx < tm->rput; idx++) {
-    Loc loc = RBAG + tm->tid * RBAG_LEN + idx;
-    dump_term(loc);
+    dump_term(rbag_ini(tm->tid) + idx);
   }
   printf("------------------\n");
+  fflush(stdout);
 }
  
 void dump_buff() {
