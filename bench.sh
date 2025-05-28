@@ -24,19 +24,19 @@ for (( i=1; i<=$num_iters; i++ )); do
     itrs=$(echo "$output" | grep "ITRS:" | awk '{print $2}')
     size=$(echo "$output" | grep "SIZE:" | awk '{print $2}')
     
-    if [ -z "$mips" ] || [ -z "$itrs" ] || [ -z "$size" ]; then
-        echo "ERROR: Could not find MIPS, ITRS, or SIZE in program output"
-        echo "Output:"
-        echo "$output"
-        continue
-    fi
-    
     if [ "$first_itrs" -eq 0 ]; then
         first_itrs="$itrs"
-    elif [ "$first_itrs" -ne "$itrs" ]; then
-        echo "ERROR @ $i: ITRS: $itrs mismatch with first ITRS: $first_itrs"
+    elif [ -z "$itrs" ] || [ "$first_itrs" -ne "$itrs" ]; then
+        if [ -z "$itrs" ]; then
+            echo "ERROR @ $i: missing ITRS"
+        else
+            echo "ERROR @ $i: ITRS: $itrs mismatch with first ITRS: $first_itrs"
+        fi
         echo "Output:"
         echo "$output"
+        echo "------"
+        echo "tail out:"
+        tail "$outfile"
         exit 1
     fi
 
