@@ -141,13 +141,13 @@ enum : u64 {
   ZERO = 0,
 
   // Threads per CPU
-  TPC = 2,
+  TPC = 4,
 
   // Number of terms *per thread* for each overflow bag. There are two of them,
   // and they (currently) steal space from each thread's RBAG space.
   // NB: These numbers are a bit aggresive. Overflow of overflow could happen.
-  OFLW_LEN = 2048,
-  OFLW_SYNC = OFLW_LEN / 2,
+  OFLW_LEN = 1024,
+  OFLW_SYNC = OFLW_LEN,
 
   // Various redex bag sizes within the heap to choose from. The remaining
   // percentage is used for node storage.
@@ -830,7 +830,8 @@ static void rbag_push(TM *tm, Term neg, Term pos, bool force_oflw) {
   } else if (off >= OFLW_INI) {
     // pushed to overflow
     if (tm->oput[tm->opid] >= OFLW_LEN-1) {
-      fprintf(stderr, "%u overflow %u space exhausted\n", tm->tid, tm->opid);
+      fprintf(stderr, "%u overflow %u space exhausted @ %u\n", tm->tid,
+              tm->opid, tm->oput[tm->opid]);
       exit(1);
     }
     tm->oput[tm->opid] += 2;
@@ -846,23 +847,38 @@ static void rbag_push(TM *tm, Term neg, Term pos, bool force_oflw) {
 
 static Loc redex_pop_loc(TM* tm) {
   // Must check overflow bag first when sync'd
-  if (tm->ouse && tm->osyn) {
-    u32 oidx = 1u - tm->opid;
-    u32 oput = tm->oput[oidx];
-    if (oput > 0) {
-      oput -= 2;
-      tm->oput[oidx] = oput;
+  if (tm->ouse) {
 
-      #if 0 || defined(DEBUG)
-      if (oflw_debug) {
-        fprintf(stderr, "%u popping from overflow %u @ %u\n", tm->tid,
-                oidx, oput);
+    if (tm->osyn) {
+      // Overflow is sync'd so we can pop
+      u32 oidx = 1u - tm->opid;
+      u32 oput = tm->oput[oidx];
+      if (oput > 0) {
+        oput -= 2;
+        tm->oput[oidx] = oput;
+        
+        #if 0 || defined(DEBUG)
+        if (oflw_debug) {
+          fprintf(stderr, "%u popping from overflow %u @ %u\n", tm->tid,
+                  oidx, oput);
+        }
+        #endif
+        
+        return oflw_ini(tm->tid, oidx) + oput;
       }
-      #endif
-
-      return oflw_ini(tm->tid, oidx) + oput;
     }
-  } 
+
+    // If the overflow put bag is full, don't allow any pops from anywhere.
+    // Overflow will empty on next sync.
+    u32 oput = tm->oput[tm->opid];
+    u32 opop = tm->oput[1-tm->opid] / 2;
+    if (oput+opop >= OFLW_LEN) {
+      //fprintf(stderr, "%u no pops overflow %u full\n", tm->tid, tm->opid);
+      return 0;
+    }
+
+  }
+    
   if (tm->spop > 0) {
     // Pop from stolen, non-empty booty bag
     tm->spop -= 2;
@@ -903,7 +919,7 @@ void hvm_init() {
   fprintf(stderr, "NODE_LEN  = %u\n", NODE_LEN);
   #endif
 
-  //signal(SIGSEGV, segv_handler);
+  signal(SIGSEGV, segv_handler);
 
 #ifdef MEMLOG
   mlog_init();
@@ -1854,30 +1870,41 @@ struct SIMPLE_SYNC {
   a64 departed;
 } ss;
 
-static bool sync_start(u32 tid) {
+static bool sync_arrive(u32 tid) {
   u64 prev_arrived = atomic_fetch_add_explicit(&ss.arrived, 1, memory_order_relaxed);
   if (prev_arrived + 1 == TPC) {
     // Last to arrive
+    atomic_store_explicit(&ss.departed, 1ULL, memory_order_release);
     atomic_store_explicit(&ss.arrived, ZERO, memory_order_relaxed);
-    atomic_fetch_add_explicit(&ss.departed, 1, memory_order_release);
     return true;
   }
   return false;
 }
 
-static bool sync_wait(bool departed) {
-  u64 dep_cnt = 0;
+_Thread_local u32 nsync = 0;
+
+static bool sync_depart(bool departed) {
   if (!departed) {
-    dep_cnt = atomic_fetch_add_explicit(&ss.departed, 1, memory_order_release);
-  } else {
-    dep_cnt = atomic_load_explicit(&ss.departed, memory_order_relaxed);
+    if (atomic_load_explicit(&ss.arrived, memory_order_relaxed) > 0) {
+      return false;
+    }
+    /*u64 dep_cnt = */atomic_fetch_add_explicit(&ss.departed, 1, memory_order_release);
+    //technically a "sync done" shortcut for 1 person here, i just dont know
+    // how to return it.
   }
-  if ((dep_cnt % TPC) == 0) {
-    atomic_thread_fence(memory_order_acquire);
-    return false;
-  } else {
-    return true;
+  return true;
+}
+
+static bool sync_wait(bool departed) {
+  if (departed) {
+    u64 dep_cnt = atomic_load_explicit(&ss.departed, memory_order_relaxed);
+    if ((dep_cnt % TPC) == 0) {
+      nsync += 1;
+      atomic_thread_fence(memory_order_acquire);
+      return false;
+    }
   }
+  return true;
 }
 
 static void* thread_func(void* arg) {
@@ -1904,38 +1931,40 @@ static void* thread_func(void* arg) {
     tick += 1;
 
     if (tm->ouse) {
-      if ((tick % OFLW_SYNC) == 0) {
-        if (!syncing) {
-          departed = sync_start(tm->tid);
-          syncing = true;
-
-          if (oflw_debug) {
-            fprintf(stderr, "%u syncing, stop taking from overflow %u oput %u\n",
-                    tm->tid, 0u+tm->opid, tm->oput[tm->opid]);
-          }
-          
-          // TODO: assert(oput[oidx] == 0);
-          tm->opid = 1 - tm->opid;
-          // Just in case it's not empty (it should be)
-          //tm->otak = false;
-          tm->osyn = false;
+      u64 tick_mod = tick % OFLW_SYNC;
+      if ((tick_mod == 0) && !syncing) {
+        departed = sync_arrive(tm->tid);
+        syncing = true;
+        
+        if (0 || oflw_debug) {
+          fprintf(stderr, "%u syncing @ %u, stop taking from overflow %u len %u\n",
+                  tm->tid, nsync+1, 1u-tm->opid, tm->oput[1u-tm->opid]/2);
         }
+        
+        // TODO: assert(oput[oidx] == 0);
+        tm->opid = 1 - tm->opid;
+        // Just in case it's not empty (it should be)
+        //tm->otak = false;
+        tm->osyn = false;
       } else if (syncing) {
+        departed = sync_depart(departed);
         syncing = sync_wait(departed);
-        departed = true;
         if (!syncing) {
-
-          if (oflw_debug) {
-            fprintf(stderr, "%u sync'd, can take from overflow %u size %u\n",
-                    tm->tid, 1u-tm->opid, tm->oput[1u-tm->opid]);
-          }
-
-          //tm->otak = true;
           tm->osyn = true;
+          //tm->otak = true;
           // Reset tick count to ensure we empty oveflow before next sync point
           // TODO: could also try something like:
-          //       if ((tick % sync) < oput[1-oidx]) tick = sync - oput[1-oidx]
-          tick = 0;
+          //if ((tick % sync) < oput[1-oidx]) 
+          // just enough rope to hang ourselves
+          u32 oflw_len = (tm->oput[1-tm->opid] / 2);
+          if (tick_mod < oflw_len) {
+            tick = OFLW_SYNC - oflw_len;
+          }
+          //tick = 0;
+          if (0 || oflw_debug) {
+            fprintf(stderr, "%u synched @ %u, can take from overflow %u len %u tick %" PRIu64 "\n",
+                    tm->tid, nsync, 1u-tm->opid, tm->oput[1u-tm->opid]/2, tick);
+          }
         }
       }
     }
