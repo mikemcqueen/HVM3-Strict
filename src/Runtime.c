@@ -21,20 +21,9 @@
 
 #define DEBUG_LOG(fmt, ...) fprintf(stderr, "[DEBUG] " fmt "\n", ##__VA_ARGS__)
 
-typedef pthread_t thread_t;
-
 int get_num_threads() {
   long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
   return (nprocs <= 1) ? 1 : 1 << (int)log2(nprocs);
-}
-
-int thread_create(pthread_t *thread, const pthread_attr_t *attr,
-                  void *(*start_routine)(void *), void *arg) {
-  return pthread_create(thread, attr, start_routine, arg);
-}
-
-int thread_join(pthread_t thread, void **retval) {
-  return pthread_join(thread, retval);
 }
 
 void segv_handler(int sig) {
@@ -146,18 +135,17 @@ enum : u64 {
   // Number of terms *per thread* for each overflow bag. There are two of them,
   // and they (currently) steal space from each thread's RBAG space.
   // NB: These numbers are a bit aggresive. Overflow of overflow could happen.
-  OFLW_LEN = 1024,
-  OFLW_SYNC = OFLW_LEN,
+  OFLW_LEN = 1 << 18,
+  OFLW_SYNC = 1024,
 
   // Various redex bag sizes within the heap to choose from. The remaining
-  // percentage is used for node storage.
-  //RBAG_4096 = 4096 * TPC * sizeof(Term),
-  RBAG_8192 = 8192 * TPC * sizeof(Term),
+  // percentage is used for node storage. Assumes 10 threads.
+  RBAG_TEST = (1 << 23) * TPC * sizeof(Pair),
 
   //////////////////////////
   // Choose a RBAG size here
   //////////////////////////
-  RBAG_SIZE = RBAG_8192,
+  RBAG_SIZE = RBAG_TEST,
 };
 
 enum : u32 {
@@ -262,7 +250,7 @@ typedef struct BB {
 
 static TM *tms[TPC];
 static BB bbs[TPC];
-static thread_t threads[TPC];
+static pthread_t threads[TPC];
 static uint8_t unprocessed_itrs[255] = { 0 };
 
 static _Thread_local int thread_id = 0;
@@ -505,7 +493,7 @@ void cancel_threads() {
   }
   for (int i = 0; i < TPC; i++) {
     if (i != thread_id) {
-      thread_join(threads[i], NULL);
+      pthread_join(threads[i], NULL);
     }
   }
 }
@@ -845,6 +833,8 @@ static void rbag_push(TM *tm, Term neg, Term pos, bool force_oflw) {
   }
 }
 
+_Thread_local u64 noflw = 0;
+
 static Loc redex_pop_loc(TM* tm) {
   // Must check overflow bag first when sync'd
   if (tm->ouse) {
@@ -863,11 +853,14 @@ static Loc redex_pop_loc(TM* tm) {
                   oidx, oput);
         }
         #endif
+
+        ++noflw;
         
         return oflw_ini(tm->tid, oidx) + oput;
       }
     }
 
+#if 0
     // If the overflow put bag is full, don't allow any pops from anywhere.
     // Overflow will empty on next sync.
     u32 oput = tm->oput[tm->opid];
@@ -876,7 +869,7 @@ static Loc redex_pop_loc(TM* tm) {
       //fprintf(stderr, "%u no pops overflow %u full\n", tm->tid, tm->opid);
       return 0;
     }
-
+#endif
   }
     
   if (tm->spop > 0) {
@@ -1865,6 +1858,33 @@ static bool take_and_interact(TM *tm, Loc loc, bool from_bty) {
   return interact(tm, pair_neg(pair), pair_pos(pair));
 }
 
+#include <sys/sysctl.h>
+#include <mach/mach.h>
+#include <mach/thread_policy.h>
+
+void setup_thread_for_pcore(int thread_id) {
+    // Set high QoS first
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    
+    // Then try to bind to specific P-core
+    thread_affinity_policy_data_t policy;
+    policy.affinity_tag = thread_id; // 0-3 for P-cores
+    thread_policy_set(mach_thread_self(), THREAD_AFFINITY_POLICY,
+                     (thread_policy_t)&policy, THREAD_AFFINITY_POLICY_COUNT);
+}
+
+void setup_thread_for_ecore(int thread_id) {
+    // Set lower QoS
+    pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+    
+    // Bind to E-core
+    thread_affinity_policy_data_t policy;
+    policy.affinity_tag = thread_id; // 4-9 for E-cores
+    thread_policy_set(mach_thread_self(), THREAD_AFFINITY_POLICY,
+                     (thread_policy_t)&policy, THREAD_AFFINITY_POLICY_COUNT);
+}
+
+
 struct SIMPLE_SYNC {
   a64 arrived;
   a64 departed;
@@ -1907,8 +1927,27 @@ static bool sync_wait(bool departed) {
   return true;
 }
 
+static u64 work_quantum(u64 time, bool ecore) {
+  // 24000 = 1ms
+  u64 work = 2400;
+  if (ecore) {
+    work = work / 2;
+  }
+  return time + work;
+}
+
 static void* thread_func(void* arg) {
   thread_id = (u64)arg;
+
+  bool ecore = false;
+
+  if (thread_id < 4) {
+    setup_thread_for_pcore(thread_id);
+  } else {
+    setup_thread_for_ecore(thread_id);
+    ecore = true;
+  }
+  
   TM *tm = tms[thread_id];
 
   // Wait until after injection to turn these on
@@ -1920,7 +1959,11 @@ static void* thread_func(void* arg) {
   // TODO: Could moving these to global to reduce code in this funciton
   bool syncing = false;
   bool departed = false;
+  u64 do_nothing = 0;
 
+  u64 time = read_cntvct();
+  u64 next_time = work_quantum(time, ecore);
+  
   u64  tick = 0;
   bool busy = tm->tid == 0;
   while (true) {
@@ -1931,22 +1974,28 @@ static void* thread_func(void* arg) {
     tick += 1;
 
     if (tm->ouse) {
-      u64 tick_mod = tick % OFLW_SYNC;
-      if ((tick_mod == 0) && !syncing) {
-        departed = sync_arrive(tm->tid);
-        syncing = true;
-        
-        if (0 || oflw_debug) {
-          fprintf(stderr, "%u syncing @ %u, stop taking from overflow %u len %u\n",
-                  tm->tid, nsync+1, 1u-tm->opid, tm->oput[1u-tm->opid]/2);
+      if (!syncing) {
+        time = read_cntvct();
+        if (time >= next_time) {
+          //u64 tick_mod = tick % OFLW_SYNC;
+          //if ((tick_mod == 0) && !syncing) {
+          departed = sync_arrive(tm->tid);
+          syncing = true;
+          
+          if (0 || oflw_debug) {
+            fprintf(stderr, "%u syncing @ %u, stop taking from overflow %u len %u\n",
+                    tm->tid, nsync+1, 1u-tm->opid, tm->oput[1u-tm->opid]/2);
+            time = read_cntvct();
+          }
+          next_time = work_quantum(time, ecore);
+          
+          // TODO: assert(oput[oidx] == 0);
+          tm->opid = 1 - tm->opid;
+          // Just in case it's not empty (it should be)
+          //tm->otak = false;
+          tm->osyn = false;
         }
-        
-        // TODO: assert(oput[oidx] == 0);
-        tm->opid = 1 - tm->opid;
-        // Just in case it's not empty (it should be)
-        //tm->otak = false;
-        tm->osyn = false;
-      } else if (syncing) {
+      } else { //if (syncing) {
         departed = sync_depart(departed);
         syncing = sync_wait(departed);
         if (!syncing) {
@@ -1956,15 +2005,20 @@ static void* thread_func(void* arg) {
           // TODO: could also try something like:
           //if ((tick % sync) < oput[1-oidx]) 
           // just enough rope to hang ourselves
+          #if 0
           u32 oflw_len = (tm->oput[1-tm->opid] / 2);
           if (tick_mod < oflw_len) {
             tick = OFLW_SYNC - oflw_len;
           }
+          #else
           //tick = 0;
+          #endif
           if (0 || oflw_debug) {
-            fprintf(stderr, "%u synched @ %u, can take from overflow %u len %u tick %" PRIu64 "\n",
-                    tm->tid, nsync, 1u-tm->opid, tm->oput[1u-tm->opid]/2, tick);
+            fprintf(stderr, "%u synched @ %u, can take from overflow %u len %u\n", // tick %" PRIu64 "\n",
+                    tm->tid, nsync, 1u-tm->opid, tm->oput[1u-tm->opid]/2); // , tick);
           }
+          u64 time = read_cntvct();
+          next_time = work_quantum(time, ecore);
         }
       }
     }
@@ -1992,12 +2046,15 @@ static void* thread_func(void* arg) {
         bbag_set(tm->tid, FULL, memory_order_release);
         tm->bful = true;
       }
-    } else if (can_idle(tm)) {
-      busy = set_idle(busy);
-      if (!busy && !try_steal(tm)) {
-        sched_yield();
-        if (timeout(tick))
-          break;
+    } else {
+      do_nothing += 1;
+      if (can_idle(tm)) {
+        busy = set_idle(busy);
+        if (!busy && !try_steal(tm)) {
+          sched_yield();
+          if (timeout(tick))
+            break;
+        }
       }
     }
   }
@@ -2006,8 +2063,8 @@ static void* thread_func(void* arg) {
   atomic_fetch_add(&net.itrs, tm->itrs);
 
   if (1) {
-    fprintf(stderr, "t%u itrs %" PRIu64 ", steals good %u bad %u\n",
-            tm->tid, tm->itrs, tm->sgud, tm->sbad);
+    fprintf(stderr, "t%u itrs %" PRIu64 ", steals good %u bad %u oflw %" PRIu64 " do_nothing %" PRIu64 "\n",
+            tm->tid, tm->itrs, tm->sgud, tm->sbad, noflw, do_nothing);
   }
   return NULL;
 }
@@ -2018,11 +2075,11 @@ static void parallel_normalize() {
   atomic_store_explicit(&ss.departed, ZERO, memory_order_relaxed);
 
   for (u64 i = 0; i < TPC; i++) {
-    /*int rc = */thread_create(&threads[i], NULL, thread_func, (void*)i);
+    /*int rc = */pthread_create(&threads[i], NULL, thread_func, (void*)i);
   }
 
   for (u64 i = 0; i < TPC; i++) {
-    thread_join(threads[i], NULL);
+    pthread_join(threads[i], NULL);
   }
 
   show_unprocessed_itrs();
