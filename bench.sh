@@ -25,16 +25,13 @@ outfile=out
 echo "Running $cmd for $num_iters iterations..."
 
 for (( i=1; i<=$num_iters; i++ )); do
-    echo 1
     output=$($cmd 2>$outfile)
-    echo 2
     
     mips=$(echo "$output" | grep "MIPS:" | awk '{print $2}')
     itrs=$(echo "$output" | grep "ITRS:" | awk '{print $2}')
     size=$(echo "$output" | grep "SIZE:" | awk '{print $2}')
     
     [[ -z "$itrs" ]] && err=1 || err=0
-    echo "err=$err, itrs=$itrs"
 
     if (( !err )) && [[ $first_itrs == 0 ]]; then
         first_itrs="$itrs"
@@ -50,8 +47,6 @@ for (( i=1; i<=$num_iters; i++ )); do
         echo "tail out:"
         tail "$outfile"
         exit 1
-    else
-        echo what
     fi
 
     if [[ $mips < $min_mips ]]; then
