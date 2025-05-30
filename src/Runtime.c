@@ -996,7 +996,9 @@ static Loc oflw_pop_loc(TM *tm) {
 }
 
 static void oflw_sync(TM *tm) {
+#ifdef __APPLE__
   dmb_ishst();
+#endif
   tm->opid = 1u - tm->opid;
   tm->osyn = true;
 }
