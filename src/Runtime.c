@@ -19,7 +19,6 @@
 //#define SUMMARY
 
 //#define DEBUG
-//#define MEMLOG
 //#define VOIDTEST
 
 #define DEBUG_LOG(fmt, ...) fprintf(stderr, "[DEBUG] " fmt "\n", ##__VA_ARGS__)
@@ -233,14 +232,6 @@ typedef struct TM {
 
   Loc oput[2]; // next oflw bag push indices
   
-#ifdef MEMLOG
-  u32 mput;
-  u32 itid;
-  u8 i1_tag;
-  u8 i2_tag;
-  bool mwrp; // memlog wrapped
-#endif
-
   bool buse; // can use booty bag
   bool bhld; // when we KNOW booty bag ctrl word is HELD
              // (in some cases it may be HELD but we don't know)
@@ -277,8 +268,6 @@ static _Thread_local int thread_id = 0;
 
 // Debugging
 static char *tag_to_str(Tag tag);
-static char *bty_ctrl_str(u32 ctrl);
-static void dump_term(Loc loc);
 
 static Term pair_pos(Pair pair);
 static Term pair_neg(Pair pair);
@@ -289,252 +278,13 @@ void dump_buff();
 Tag term_tag(Term term) { return term & 0xFF; }
 Loc term_loc(Term term);
 
-#ifdef MEMLOG
-// Memory operations log
-static u64 *MEMBUFF = NULL;
-enum : u32 {
-  MLOG_SIZ = (1 << 17) * TPC * sizeof(u64) * 3,
-  MLOG_LEN = MLOG_SIZ / (TPC * sizeof(u64))
-};
-
-//static _Thread_local u64 rbag_loc = 0;
-#define MLOG(mop, loc, t1, t2)          mlog((u32)thread_id, mop, loc, t1, t2, 0)
-#define MLOG_PAIR(mop, loc, pair)       mlog_pair((u32)thread_id, mop, loc, pair)
-#define MLOG_LVL(mop, loc, lvl, t1, t2) mlog((u32)thread_id, mop, loc, t1, t2, lvl)
-#else
-#define MLOG(mop, loc, t1, t2)
-#define MLOG_PAIR(mop, loc, pair)
-#define MLOG_LVL(mop, loc, lvl, t1, t2)
-#endif
-
-static u32 u64_hi(u64 u) {
-  return (u >> 32) & 0xFFFFFFFF;
+static u32 u64_hi(u64 e) {
+  return e >> 32;
 }
 
-__attribute__((unused))
-static u32 u64_lo(u64 u) {
-  return u & 0xFFFFFFFF;
-}
-
-// Memory operations
-#define MOP_EXCH 0x01
-#define MOP_LOAD 0x02
-#define MOP_STOR 0x03
-
-#ifdef MEMLOG
-
-static const char* mop_str(u32 mop) {
-  switch (mop) {
-  case MOP_EXCH: return "EXCH";
-  case MOP_LOAD: return "LOAD";
-  case MOP_STOR: return "STOR";
-  default: return "????";
-  }
-}
-
-static void mlog_init() {
-  if (MEMBUFF == NULL) {
-    MEMBUFF = aligned_alloc(CACH_SIZ, MLOG_SIZ);
-  }
-}
-
-static void mlog_free() {
-  if (MEMBUFF != NULL) {
-    free(MEMBUFF);
-    MEMBUFF = NULL;
-  }
-}
-
-// i1_tag: 4, i2_tag: 4, lvl: 5, op: 2, t1_tag: 4, t2_tag: 4, tid: 4, sid: 4
-
-static u64 mlog_entry(u32 tid, u32 mop, u32 sid, u32 loc, u32 lvl,
-                      u32 i1_tag, u32 i2_tag, u32 t1_tag, u32 t2_tag) {
-  u64 hi = (i1_tag << 27) | ((i2_tag & 0xF) << 23) |
-    ((lvl & 0x1F) << 18) | ((mop & 0x3) << 16) |
-    ((t1_tag & 0xF) << 12) | ((t2_tag & 0xF) << 8) |
-    ((tid & 0xF) << 4) | (sid & 0xF);
-  return hi << 32 | loc;
-}
-
-static u32 mlog_i1_tag(u64 e) {
-  return (u64_hi(e) >> 27);
-}
-
-static u32 mlog_i2_tag(u64 e) {
-  return (u64_hi(e) >> 23) & 0xF;
-}
-
-static u32 mlog_lvl(u64 e) {
-  return (u64_hi(e) >> 18) & 0x1F;
-}
-
-static u32 mlog_mop(u64 e) {
-  return (u64_hi(e) >> 16) & 0x3;
-}
-
-static u32 mlog_t1_tag(u64 e) {
-  return (u64_hi(e) >> 12) & 0xF;
-}
-
-static u32 mlog_t2_tag(u64 e) {
-  return (u64_hi(e) >> 8) & 0xF;
-}
-
-static u32 mlog_tid(u64 e) {
-  return (u64_hi(e) >> 4) & 0xF;
-}
-
-__attribute__((unused))
-static u32 mlog_sid(u64 e) {
-  return u64_hi(e) & 0xF;
-}
-
-static u32 mlog_loc(u64 e) {
-  return u64_lo(e);
-}
-
-static void mlog_dump_term(FILE* fp, u64 cntr, u64 e, u32 tag, Loc loc, u32 loc_offset) {
-  fprintf(fp, "%" PRIu64 ",%u,%s%s,%s,%u,%s,%u,%u\n", cntr, mlog_tid(e),
-          tag_to_str(mlog_i1_tag(e)), tag_to_str(mlog_i2_tag(e)),
-          mop_str(mlog_mop(e)), mlog_lvl(e),
-          tag_to_str(tag), loc, mlog_loc(e) + loc_offset);
-}
-
-static u32 ndmp = 0;
-
-static void mlog_dump_entry(FILE *fp, u64 cntr, u64 e, u64 locs) {
-  ndmp += 1;
-  u32 mop = mlog_mop(e);
-  Loc t1_loc = u64_hi(locs);
-  Loc t2_loc = u64_lo(locs);
-  if ((mop == MOP_LOAD) || (mop == MOP_STOR)) {
-    mlog_dump_term(fp, cntr, e, mlog_t1_tag(e), t1_loc, 0);   // T1 
-    /*
-    if ((mlog_t2_tag(e) != 0) || (t2_loc != 0)) {
-      mlog_dump_term(fp, cntr, e, mlog_t2_tag(e), t2_loc, 1); // T2
-    }
-    */
-  } else {
-    fprintf(fp, "%" PRIu64 ",%u,%s%s,%s,%u,%s,%u,%s,%u,%u\n", cntr, mlog_tid(e),
-            tag_to_str(mlog_i1_tag(e)), tag_to_str(mlog_i2_tag(e)),
-            mop_str(mop), mlog_lvl(e), tag_to_str(mlog_t1_tag(e)), t1_loc, 
-            tag_to_str(mlog_t2_tag(e)), t2_loc, mlog_loc(e));
-  }
-}
-
-static u32 mlog_dump_range(FILE *fp, u32 ini, u32 off, u32 end, u32 *nlog) {
-  for (; (off + 2) < end; off += 3) {
-    u32 pos  = ini + off;
-    u64 cntr = MEMBUFF[pos]; 
-    u64 e    = MEMBUFF[pos+1]; // entry
-    u64 locs = MEMBUFF[pos+2];
-    mlog_dump_entry(fp, cntr, e, locs);
-    if (nlog) (*nlog)++;
-  }
-  return off;
-}
-
-static void mlog_dump(const char* fn) {
-  FILE *fp = fopen(fn, "w");
-  if (fp == NULL) {
-    perror("mlog_dump: Error opening file");
-    return;
-  }
-
-  for (u32 tid = 0; tid < TPC; tid++) {
-    TM *tm = tms[tid];
-    u32 ini = tid * MLOG_LEN;
-    u32 off = tm->mwrp ? tm->mput : 0;
-    u32 end = tm->mwrp ? MLOG_LEN : tm->mput;
-    u32 nlog = 0;
-
-    off = mlog_dump_range(fp, ini, off, end, &nlog);
-    if (tm->mwrp) {
-      if (off < end) {
-        u64 words[3];
-        u32 idx = 0;
-        for (; off < end; off++, idx++) {
-          if (idx > 2) {
-            fprintf(stderr, "idx %u!\n", idx);
-            exit(1);
-          }
-          words[idx] = MEMBUFF[ini + off];
-        }
-        off = 0;
-        end = tm->mput;
-        for (; idx < 3; idx++, off++) {
-          words[idx] = MEMBUFF[ini + off];
-        }
-        mlog_dump_entry(fp, words[0], words[1], words[2]);
-        nlog += 1;
-      } else {
-        off = 0;
-      }
-      mlog_dump_range(fp, ini, off, end, &nlog);
-    }
-  }
-  
-  fprintf(stderr, "mlog: dumped %u entries\n", ndmp);
-
-  fclose(fp);
-}
-
-static u64 mlog_get_word(u32 idx, TM *tm, u32 mop, Loc loc, u32 lvl, Term t1, Term t2) {
-  switch (idx) {
-  case 0: return read_cntvct();
-  case 1: return mlog_entry(tm->tid, mop, tm->itid, loc, lvl, tm->i1_tag,
-                            tm->i2_tag, term_tag(t1), term_tag(t2));
-  case 2: return (u64)term_loc(t1) << 32 | term_loc(t2); // TODO new_u64()
-  default:
-    break;
-  }
-  fprintf(stderr, "bad idx %u\n", idx);
-  exit(1);
-}
-
-static void mlog(u32 tid, u32 mop, Loc loc, Term t1, Term t2, u32 lvl) {
-  TM *tm = tms[tid];
-  for (u32 i = 0; i < 3; i++, tm->mput++) {
-    if (tm->mput == MLOG_LEN) {
-      tm->mput = 0;
-      tm->mwrp = true;
-    }
-    u32 pos = tid * MLOG_LEN + tm->mput;
-    MEMBUFF[pos] = mlog_get_word(i, tm, mop, loc, lvl, t1, t2);
-  }
-}
-
-static void mlog_pair(u32 tid, u32 mop, Loc loc, Pair pair) {
-  mlog(tid, mop, loc, pair_neg(pair), 0, 0);
-  mlog(tid, mop, loc+1, pair_pos(pair), 0, 0);
-}
-
-#endif // MEMLOG
-
-void cancel_threads() {
-  for (int i = 0; i < TPC; i++) {
-    if (i != thread_id) {
-      pthread_cancel(threads[i]);
-    }
-  }
-  for (int i = 0; i < TPC; i++) {
-    if (i != thread_id) {
-      pthread_join(threads[i], NULL);
-    }
-  }
-}
-
-void mlog_exit() {
-#ifdef MEMLOG
-  fprintf(stderr, "%d mlog_exit() cancelling threads...", thread_id);
-  cancel_threads();
-  fprintf(stderr, "done\n");
-  TM *tm = tms[0];
-  fprintf(stderr, "%d mput %u of LEN %u, wrap %u\n", thread_id,
-          tm->mput, MLOG_LEN, (u32)tm->mwrp);
-  mlog_dump("memlog.txt");
-#endif
-  exit(1);
+__attribute((unused))
+static u32 u64_lo(u64 e) {
+  return e & 0xFFFFFFFF;
 }
 
 // TM/BB operations
@@ -542,11 +292,6 @@ void tm_reset(TM *tm) {
   tm->rput = 0;
   tm->nput = 0;
   tm->itrs = 0;
-
-#ifdef MEMLOG
-  tm->mput = 0;
-  tm->mwrp = false;
-#endif
 }
 
 TM *tm_new(u64 tid) {
@@ -576,23 +321,9 @@ TM *tm_new(u64 tid) {
   return tm;
 }
 
-#if 0
-static BB *bb_new() {
-  size_t bb_siz = (sizeof(BB) + CACH_SIZ - 1) & ~(CACH_SIZ - 1);
-  BB *bb = aligned_alloc(CACH_SIZ, bb_siz);
-  if (bb == NULL) {
-    fprintf(stderr, "BB memory allocation failed\n");
-    exit(EXIT_FAILURE);
-  }
-  bb->ctrl = EMPTY;
-  return bb;
-}
-#endif
-
 static void alloc_static_data() {
   for (u64 t = 0; t < TPC; ++t) {
     tms[t] = tm_new(t);
-    //bbs[t] = bb_new();
   }
 }
 
@@ -648,10 +379,6 @@ static Term term_offset_loc(Term term, Loc offset) {
   return term_with_loc(term, loc);
 }
 
-#ifdef DEBUG
-static int mop_debug = 0; // memory operations
-//static int thd_debug = 0; // threading
-#endif
 __attribute__((unused))
 static int bty_debug = 0; // booty bag
 __attribute__((unused))
@@ -667,11 +394,11 @@ static const char* term_str(char* buf, Term term) {
 // Memory operations
 Term swap_lvl(Loc loc, Term term, u32 lvl) {
   Term got = atomic_exchange_explicit((a64*)&BUFF[loc], term, memory_order_relaxed);
-  MLOG_LVL(MOP_EXCH, loc, lvl, got, term);
+
   #ifdef VOIDTEST
   if (got == 0) {
     fprintf(stderr, "%d swap got NULL @ %u\n", thread_id, loc);
-    mlog_exit();
+    exit_stacktrace();
   }
   #endif
   return got;
@@ -683,11 +410,11 @@ Term swap(Loc loc, Term term) {
 
 Term take(Loc loc) {
   Term term = atomic_exchange_explicit((a64*)&BUFF[loc], ZERO, memory_order_relaxed);
-  MLOG(MOP_EXCH, loc, term, 0);
+
   #ifdef VOIDTEST
   if (term == 0) {
     fprintf(stderr, "%d take got NULL @ %u\n", thread_id, loc);
-    mlog_exit();
+    exit_stacktrace();
   }
   #endif
   return term;
@@ -695,38 +422,25 @@ Term take(Loc loc) {
 
 Term get(Loc loc) {
   Term term = atomic_load_explicit((a64*)&BUFF[loc], memory_order_relaxed);
-  MLOG(MOP_LOAD, loc, term, 0);
   return term;
 }
 
 void set(Loc loc, Term term) {
   atomic_store_explicit((a64*)&BUFF[loc], term, memory_order_relaxed);
-  MLOG(MOP_STOR, loc, term, 0);
+
 }
 
 static Pair take_pair(Loc loc) {
   Pair pair = *(Pair*)&BUFF[loc];
   
   // Debugging
-  #if defined(MEMLOG) || defined(VOIDTEST)
+  #if defined(VOIDTEST)
   Term neg = pair_neg(pair);
   Term pos = pair_pos(pair);
-  #endif
-
-  #if defined(MEMLOG)
-  TM *tm = tms[thread_id];
-  tm->i1_tag = term_tag(neg);
-  tm->i2_tag = term_tag(pos);
-  tm->itid = tm->id; // bty ? tm->sid : tm->tid;
-  #endif
-  MLOG_PAIR(MOP_LOAD, loc, pair);
-
-  #ifdef VOIDTEST
   //*(Pair*)&BUFF[loc] = (Pair)ZERO;
   if ((neg == 0) || (pos == 0)) {
     fprintf(stderr, "%d take_pair: void term taken\n", thread_id);
     exit_stacktrace();
-    //    mlog_exit();
   }
   #endif
   
@@ -739,12 +453,11 @@ static void set_pair(Loc loc, Pair pair) {
   Term pos = pair_pos(pair);
   if ((neg == 0) || (pos == 0)) {
     fprintf(stderr, "%d set_pair: void term\n", thread_id);
-    mlog_exit();
+    exit_stacktrace();
   }
   #endif
 
   *((Pair*)&BUFF[loc]) = pair;
-  MLOG_PAIR(MOP_STOR, loc, pair);
 }
 
 static Loc port(u64 n, Loc loc) { return n + loc - 1; }
@@ -779,20 +492,20 @@ static u32 bbag_get(u32 tid) {
   return atomic_load_explicit(&bbs[tid].ctrl, memory_order_relaxed);
 }
 
+// Drop a held, full booty bag (make it steal-able)
 static void bbag_drop(TM *tm) {
   #if defined(DEBUG)
   if (bty_debug) {
-    fprintf(stderr, "%u dropping bbag! bput %u rput %u\n", //added %u dexes,
+    fprintf(stderr, "%u dropping bbag! bput %u rput %u\n",
             tm->tid, tm->bput, tm->rput);
   }
   #endif
 
-  // TODO: compare_exchange from STOLEN for added safety
   bbag_set(tm->tid, DROPPED, memory_order_release);
   tm->bhld = false;
 }
 
-// attempt to recover a tossed (stolen, and emptied) booty bag
+// Attempt to recover a tossed (stolen, and emptied) booty bag
 static bool bbag_recover(TM *tm) {
   bool held = bbag_get(tm->tid) == HELD;
   if (held) {
@@ -808,9 +521,8 @@ static bool bbag_recover(TM *tm) {
   return held;
 }
 
-// attempt to pick up our own dropped booty bag. this is actually treated as
-// a form of "stealing" from self. it is the only condition under which popping
-// from our own bag is allowed.
+// Attempt to pick up our own dropped booty bag - this is treated as "stealing"
+// from ourself - the only way to pop from our own bag
 static bool bbag_pickup(TM *tm) {
   bool held = bbag_compare_swap(tm->tid, DROPPED, HELD, memory_order_relaxed);
   if (held) {
@@ -827,7 +539,7 @@ static bool bbag_pickup(TM *tm) {
   return held;
 }
 
-// attempt to steal another thread's dropped booty bag
+// Attempt to steal another thread's dropped booty bag
 static bool bbag_steal(TM *tm, u32 sid) {
   bool stole = bbag_compare_swap(sid, DROPPED, STOLEN, memory_order_acquire);
   if (stole) {
@@ -843,12 +555,11 @@ static bool bbag_steal(TM *tm, u32 sid) {
   return stole;
 }
 
-// toss the booty bag we stole from another thread and emptied
+// Toss the booty bag we stole from another thread and emptied
 static void bbag_toss(TM *tm) {
   #if defined(DEBUG)
   if (bty_debug) {
-    fprintf(stderr, "%u tossing t%u's empty stolen bbag!\n",// removed %u dexes\n",
-            tm->tid, tm->sid);//, tm->srem);
+    fprintf(stderr, "%u tossing t%u's empty stolen bbag!\n", tm->tid, tm->sid);
   }
   #endif
 
@@ -888,13 +599,6 @@ static u64 align(u64 align, u64 val) {
 }
 
 static Loc node_alloc(TM *tm, u32 cnt) {
-  #ifdef DEBUG
-  if (mop_debug) {
-    fprintf(stderr, "%u node alloc cnt: %u, nput: %u\n", tm->tid, cnt,
-            tm->nput);
-  }
-  #endif
-
   if (tm->nput + cnt >= NODE_LEN) {
     fprintf(stderr, "%u node space exhausted, nput: %u, cnt: %u, LEN: %u\n",
             tm->tid, tm->nput, cnt, NODE_LEN);
@@ -948,7 +652,6 @@ static void rbag_push(TM *tm, Term neg, Term pos, bool force_oflw) {
   if ((neg == 0) || (pos == 0)) {
     fprintf(stderr, "%d rbag_push: void term\n", thread_id);
     exit_stacktrace();
-    //    mlog_exit();
   }
   #endif
 
@@ -957,11 +660,9 @@ static void rbag_push(TM *tm, Term neg, Term pos, bool force_oflw) {
 
   set_pair(loc, pair_new(neg, pos));
 
-  // TODO: adjust_put_idx(tm, off);
-
   #ifdef DEBUG
   if (off > BBAG_LEN) {
-    // pushed to RBAG
+    // Pushed to RBAG
     if (tm->rput >= RPUT_MAX-1) {
       fprintf(stderr, "%u rbag space exhausted\n", tm->tid);
       exit(1);
@@ -1004,7 +705,7 @@ static void oflw_sync(TM *tm) {
 }
 
 static Loc redex_pop_loc(TM* tm) {
-  // Must check overflow bag first when sync'd
+  // Check overflow bag first when sync'd
   if (tm->ouse) {
     Loc loc = oflw_pop_loc(tm);
     if (loc > 0) return loc;
@@ -1017,11 +718,10 @@ static Loc redex_pop_loc(TM* tm) {
   }
     
   if ((tm->sid < TPC) && (tm->spop > 0)) {
-    // Pop from stolen non-empty booty bag - but we could have 'stolen' our
-    // own HELD bag.
+    // Pop from stolen non-empty booty bag - but it may be our HELD bag
     tm->spop -= 2;
 
-    // If we are stealing from our own booty bag, adjust push index as well
+    // If we are stealing from our own bag, adjust push index as well
     if (tm->sid == tm->tid) {
       tm->bput -= 2;
     }
@@ -1043,6 +743,7 @@ static Loc redex_pop_loc(TM* tm) {
 
     return rbag_ini(tm->tid) + tm->rput;
   } else if (tm->ouse) {
+    // Finally, try a flip & sync of overflow bags
     if (tm->oput[tm->opid] > 0) {
       oflw_sync(tm);
       Loc loc = oflw_pop_loc(tm);
@@ -1080,10 +781,6 @@ void hvm_init() {
   #ifdef DEBUG
   signal(SIGSEGV, segv_handler);
   #endif
-
-  #ifdef MEMLOG
-  mlog_init();
-  #endif
 }
 
 void hvm_free() {
@@ -1092,10 +789,6 @@ void hvm_free() {
     BUFF = NULL;
   }
   free_static_data();
-
-  #ifdef MEMLOG
-  mlog_free();
-  #endif
 }
 
 Loc ffi_alloc_node(u64 arity) {
@@ -1115,7 +808,6 @@ u64 inc_itr() {
     itrs += tms[i]->itrs;
   }
   return itrs;
-  //return atomic_load(&net.itrs);
 } 
 
 Loc ffi_rbag_ini() {
@@ -1134,7 +826,6 @@ Loc ffi_rnod_end() {
     nods += tms[i]->nput;
   }
   return nods;
-  //return atomic_load(&net.nods);
 }
 
 // Moves the global buffer and redex bag into a new def and resets
@@ -1217,7 +908,6 @@ static Term expand_ref(TM *tm, Loc def_idx) {
     Loc loc = offset + n;
     Term term = term_offset_loc(nodes[n], offset);
     BUFF[loc] = term;
-    MLOG_LVL(MOP_STOR, loc, def_idx, term, 0);
   }
 
   for (u32 i = 0; i < rbag_len; i += 2) {
@@ -2026,10 +1716,6 @@ static void* thread_func(void* arg) {
   u64  tick = 0;
   bool busy = tm->tid == 0;
   while (true) {
-    #ifdef MEMLOG
-    pthread_testcancel();
-    #endif
-
     tick += 1;
 
     // Try to recover stolen and emptied booty bag
@@ -2108,10 +1794,6 @@ Term normalize(Term term) {
     parallel_normalize();
   }
 
-#ifdef MEMLOG
-  mlog_dump("memlog.txt");
-#endif
-
   return get(0);
 }
 
@@ -2156,17 +1838,6 @@ static char *tag_to_str(Tag tag) {
 
   default:
     return "???";
-  }
-}
-
-__attribute__((unused))
-static char *bty_ctrl_str(u32 ctrl) {
-  switch (ctrl) {
-  case HELD:    return "HELD";
-  case DROPPED: return "DROPPED";
-  case STOLEN:  return "STOLEN";
-  //case TOSSED:  return "TOSSED";
-  default:      return "???";
   }
 }
 
