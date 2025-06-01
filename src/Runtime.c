@@ -1520,7 +1520,6 @@ static void* thread_func(void* arg) {
   // Wait until after injection to turn these on
   tm->buse = true;
   tm->duse = true;
-  //u64 do_nothing = 0;
 
   __attribute__((unused))
   u64  fst_steal = 0;
@@ -1548,7 +1547,6 @@ static void* thread_func(void* arg) {
 
       interact(tm, pair_neg(pair), pair_pos(pair));
     } else {
-      //do_nothing += 1;
       if (busy && can_idle(tm)) {
         busy = set_idle(busy);
       }
