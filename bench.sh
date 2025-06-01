@@ -1,14 +1,14 @@
 #!/bin/bash
 
-num_iters=20
+num_itrs=20
 
-if [ $# -gt 0 ]; then
-  num_iters="$1"
+if [[ $# > 0 ]]; then
+  num_itrs="$1"
 fi
 
 cleanup() {
     echo "Caught CTRL+C, cleaning up..."
-    pkill -P $$      # Kill all child processes of this script
+    pkill -P $$
     exit 1
 }
 
@@ -16,15 +16,15 @@ trap cleanup SIGINT
 
 cmd="cabal run . -- run examples/bench_parallel_sum_range.hvms -s"
 
-total_mips=0
+tot_mips=0
 min_mips=999999999
 max_mips=0
-first_itrs=0
-outfile=out
+fst_itrs=0
+outfile=out.bench
 
-echo "Running $cmd for $num_iters iterations..."
+echo "Running $cmd for $num_itrs iterations..."
 
-for (( i=1; i<=$num_iters; i++ )); do
+for (( i=1; i<=$num_itrs; i++ )); do
     output=$($cmd 2>$outfile)
     
     mips=$(echo "$output" | grep "MIPS:" | awk '{print $2}')
@@ -33,18 +33,18 @@ for (( i=1; i<=$num_iters; i++ )); do
     
     [[ -z "$itrs" ]] && err=1 || err=0
 
-    if (( !err )) && [[ $first_itrs == 0 ]]; then
-        first_itrs="$itrs"
-    elif (( err )) || [[ $first_itrs != $itrs ]]; then
+    if (( !err )) && [[ $fst_itrs == 0 ]]; then
+        fst_itrs="$itrs"
+    elif (( err )) || [[ $fst_itrs != $itrs ]]; then
         if (( err )); then
             echo "ERROR @ $i: missing ITRS"
         else
-            echo "ERROR @ $i: ITRS: $itrs mismatch with first ITRS: $first_itrs"
+            echo "ERROR @ $i: ITRS: $itrs mismatch with first ITRS: $fst_itrs"
         fi
         echo "Output:"
         echo "$output"
         echo "------"
-        echo "tail out:"
+        echo "tail $outfile:"
         tail "$outfile"
         exit 1
     fi
@@ -57,12 +57,12 @@ for (( i=1; i<=$num_iters; i++ )); do
         max_mips="$mips"
     fi
     
-    total_mips=$((total_mips + mips))
+    tot_mips=$((tot_mips + mips))
 done
 
-avg_mips=$(echo "scale=2; $total_mips / $num_iters" | bc -l)
+avg_mips=$(echo "scale=2; $tot_mips / $num_itrs" | bc -l)
 
 echo "--------"
-echo "Minimum MIPS: $min_mips"
-echo "Maximum MIPS: $max_mips"
-echo "Average MIPS: $avg_mips"
+echo "Min MIPS: $min_mips"
+echo "Max MIPS: $max_mips"
+echo "Avg MIPS: $avg_mips"

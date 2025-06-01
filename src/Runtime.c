@@ -16,8 +16,7 @@
 #include <string.h>
 #include <unistd.h>
 
-//#define SUMMARY
-
+#define SUMMARY
 //#define DEBUG
 //#define VOIDTEST
 
@@ -38,13 +37,8 @@ void exit_stacktrace() {
 }
 
 void segv_handler(int sig) {
-  void *array[10];
-  size_t size;
-  
-  size = backtrace(array, 10);
   fprintf(stderr, "Error: signal %d:\n", sig);
-  backtrace_symbols_fd(array, size, STDERR_FILENO);
-  exit(1);
+  exit_stacktrace();
 }
 
 #ifdef __APPLE__
@@ -59,6 +53,7 @@ __asm__(
     "   ret\n"
 );
 
+// Store barrier
 extern void dmb_ishst(void);
 __asm__(
     ".global dmb_ishst\n"
@@ -68,7 +63,7 @@ __asm__(
     "    dmb ishst\n"
     "    ret\n"
 );
-#endif
+#endif // __APPLE__
 
 // Constants
 #define VAR 0x01
@@ -129,9 +124,6 @@ typedef union {
   f32 f;
 } TypeConverter;
 
-// Global heap
-static u64 *BUFF = NULL;
-
 // Heap configuration options
 enum : u64 {
   // 1GiB heap
@@ -145,21 +137,32 @@ enum : u64 {
   // Cache line size
   CACH_SIZ = 64,
   CACH_U64 = CACH_SIZ / sizeof(u64),
-  ZERO = 0,
 
   // Threads per CPU
   TPC = 10,
 
-  // Overflow bag terms per thread (there are 2 bags)
-  OFLW_LEN = 256,
-  // When overflow bag gets this big, a memory sync occurs
-  OFLW_SYNC = 32,
+#ifdef __APPLE__
+  // PCores and ECores total, and in-use
+  PCOR_TOT = 4,
+  ECOR_TOT = TPC - PCOR_TOT,
+  PCOR = TPC < PCOR_TOT ? TPC : PCOR_TOT,
+  ECOR = TPC > PCOR_TOT ? (TPC - PCOR) : 0,
+#endif
 
-  // Includes overflow and BBAG
-  RBAG_RANDO = 8192 * TPC * sizeof(Pair),
+  // Misc
+  ZERO = 0,
+  IDLE = 256,
+
+  // Deferred bag terms per thread (2 bags: twice this len used)
+  DFER_LEN = 256,
+  // When deferred bag gets this big, a memory sync occurs
+  DFER_SYN = 32,
+
+  // Includes booty and deferred bags
+  RBAG_QED = 8192 * TPC * sizeof(Pair), // Demonstrated to work
 
   // Used in other calculations below
-  RBAG_SIZ = RBAG_RANDO,
+  RBAG_SIZ = RBAG_QED,
 };
 
 enum : u32 {
@@ -172,20 +175,18 @@ enum : u32 {
   RBAG_LEN = (RBAG_SIZ / (TPC * sizeof(Term))) & ~1ULL,
   NODE_LEN = (HEAP_SIZ - RBAG_SIZ) / (TPC * sizeof(Term)),
 
-  // Booty bag terms per thread
+  // Booty bag terms per thread (also starting offset of RBAG)
   BBAG_LEN = 96,
 
-  // Starting offset in RBAG of overflow bags
-  OFLW_INI = (RBAG_LEN - (OFLW_LEN * 2)) & ~1ULL,
+  // Starting offset of deferred bags
+  DFER_INI = (RBAG_LEN - (DFER_LEN * 2)) & ~1ULL,
 
-  // Max terms allowed in RBAG, taking into account booty bag and overflow
-  RPUT_MAX = OFLW_INI - BBAG_LEN
+  // Max terms allowed in RBAG, taking into account booty and deferred bags
+  RPUT_MAX = DFER_INI - BBAG_LEN
 };
 
 typedef struct Net {
-  a64 nods;
-  a64 itrs;
-  a32 alignas(64) idle;  // TODO Probably should just make it a64
+  a64 idle;
 } Net;
 
 // Global book
@@ -203,21 +204,6 @@ typedef struct Book {
   u32 cap;
 } Book;
 
-// TODO: net_reset()
-static Net net = {
-  .nods = 0,
-  .itrs = 0,
-  .idle = 0
-};
-
-static Book BOOK = {
-  .defs = NULL,
-  .len = 0,
-  .cap = 0,
-};
-
-#define MBUF_SIZ 10
-
 // Local Thread Memory
 typedef struct TM {
   u32 tid;   // thread id
@@ -230,15 +216,24 @@ typedef struct TM {
   u32 sgud;  // successful steal count
   u32 sbad;  // failed steal count
 
-  Loc oput[2]; // next oflw bag push indices
+  Loc dput[2]; // next deferred bag push indices
   
+  uint16_t scnt;
+  uint16_t smax;
+  uint16_t stot;
+  uint16_t smsk;
+
   bool buse; // can use booty bag
   bool bhld; // when we KNOW booty bag ctrl word is HELD
              // (in some cases it may be HELD but we don't know)
 
-  u8   opid; // oput idx we are pushing into
-  bool ouse; // can use overflow
-  bool osyn; // overflow is sync'd
+  u8   dpid; // dput idx we are pushing into
+  bool duse; // can use deferred bag
+  bool dsyn; // deferred bag is sync'd
+
+  u8   lvic;
+  u8   pvic;
+  u8   evic;
 
   u64 itrs;  // interaction count
 } TM;
@@ -246,16 +241,25 @@ typedef struct TM {
 static_assert(sizeof(TM) <= CACH_SIZ, "TM struct getting big");
 
 // Booty bag control word values
-enum : u32 {
-  HELD = 1,    // held by owner, or "tossed" by another thread
-  DROPPED = 2, // dropped by owner. can be picked back up by owner
-               // or stolen by another thread
+enum : u64 {
+  HELD = 1,    // held by owner, or "returned" by another thread
+  DROPPED = 2, // dropped by owner. can be picked back up by owner or stolen
+               // by another thread
   STOLEN = 3,  // stolen by another thread
 };
 
 typedef struct BB {
-  a32 alignas(64) ctrl; // control word TODO: just make it a64
+  a64 ctrl; // control word
 } BB;
+
+// Global heap, net, book
+static u64 *BUFF = NULL;
+static Net net;
+static Book BOOK = {
+  .defs = NULL,
+  .len = 0,
+  .cap = 0,
+};
 
 static TM *tms[TPC];
 static BB bbs[TPC];
@@ -268,23 +272,20 @@ static _Thread_local int thread_id = 0;
 
 // Debugging
 static char *tag_to_str(Tag tag);
-
-static Term pair_pos(Pair pair);
-static Term pair_neg(Pair pair);
 static const char* term_str(char* buf, Term term);
+
+__attribute__((unused))
+static int bty_debug = 0; // booty bag
+__attribute__((unused))
+static int dfer_debug = 0; // deferred bag
 
 // FFI functions
 void dump_buff();
 Tag term_tag(Term term) { return term & 0xFF; }
 Loc term_loc(Term term);
 
-static u32 u64_hi(u64 e) {
-  return e >> 32;
-}
-
-__attribute((unused))
-static u32 u64_lo(u64 e) {
-  return e & 0xFFFFFFFF;
+static u64 align(u64 align, u64 val) {
+  return (val + align - 1) & ~(align - 1);
 }
 
 // TM/BB operations
@@ -296,27 +297,42 @@ void tm_reset(TM *tm) {
 
 TM *tm_new(u64 tid) {
   // make size a multiple of alignment
-  size_t tm_siz = (sizeof(TM) + CACH_SIZ - 1) & ~(CACH_SIZ - 1);
-  TM *tm = aligned_alloc(CACH_SIZ, tm_siz);
+  TM *tm = aligned_alloc(CACH_SIZ, align(CACH_SIZ, sizeof(TM)));
   if (tm == NULL) {
-    fprintf(stderr, "TM memory allocation failed\n");
-    exit(EXIT_FAILURE);
+    fprintf(stderr, "tm_new() memory allocation failed\n");
+    exit(1);
   }
   tm_reset(tm);
+
   tm->tid = tid;
+
+  // Booty bag
   tm->bput = 0;
-  tm->spop = 0;
-  tm->sid = TPC;
-  tm->sgud = 0;
-  tm->sbad = 0;
   tm->bhld = true;
   tm->buse = false;
 
-  tm->oput[0] = 0;
-  tm->oput[1] = 0;
-  tm->opid = 0;
-  tm->ouse = false;
-  tm->osyn = false;
+  // Stolen booty bag
+  tm->sid = TPC;
+  tm->spop = 0;
+  tm->sgud = 0;
+  tm->sbad = 0;
+
+  // Deferred bag
+  tm->dput[0] = 0;
+  tm->dput[1] = 0;
+  tm->dpid = 0;
+  tm->duse = false;
+  tm->dsyn = false;
+
+  // Last steal attempt thread ids
+  tm->lvic = TPC;
+  tm->pvic = tid % PCOR;
+  tm->evic = (tid % ECOR) + PCOR;
+
+  tm->scnt = 0;
+  tm->smax = 0;
+  tm->stot = 0;
+  tm->smsk = 0;
 
   return tm;
 }
@@ -333,12 +349,6 @@ static void free_static_data() {
       free(tms[t]);
       tms[t] = NULL;
     }
-    #if 0
-    if (bbs[t] != NULL) {
-      free(bbs[t]);
-      bbs[t] = NULL;
-    }
-    #endif
   }
 }
 
@@ -362,7 +372,7 @@ Term term_new(Tag tag, Lab lab, Loc loc) {
 
 Lab term_lab(Term term) { return (term >> 8) & 0xFFFFFF; }
 
-Loc term_loc(Term term) { return u64_hi(term); }
+Loc term_loc(Term term) { return term >> 32; }
 
 static Term term_with_loc(Term term, Loc loc) {
   return (((Term)loc) << 32) | (term & 0xFFFFFFFF);
@@ -379,20 +389,10 @@ static Term term_offset_loc(Term term, Loc offset) {
   return term_with_loc(term, loc);
 }
 
-__attribute__((unused))
-static int bty_debug = 0; // booty bag
-__attribute__((unused))
-static int oflw_debug = 0; // overflow
-
-__attribute__((unused))
-static const char* term_str(char* buf, Term term) {
-  snprintf(buf, 64, "%s lab:%u loc:%u", tag_to_str(term_tag(term)),
-          (u32)term_lab(term), (u32)term_loc(term));
-  return buf;
-}
+static Loc port(u32 n, Loc loc) { return n + loc - 1; }
 
 // Memory operations
-Term swap_lvl(Loc loc, Term term, u32 lvl) {
+Term swap(Loc loc, Term term) {
   Term got = atomic_exchange_explicit((a64*)&BUFF[loc], term, memory_order_relaxed);
 
   #ifdef VOIDTEST
@@ -402,10 +402,6 @@ Term swap_lvl(Loc loc, Term term, u32 lvl) {
   }
   #endif
   return got;
-}
-
-Term swap(Loc loc, Term term) {
-  return swap_lvl(loc, term, 0);
 }
 
 Term take(Loc loc) {
@@ -427,7 +423,6 @@ Term get(Loc loc) {
 
 void set(Loc loc, Term term) {
   atomic_store_explicit((a64*)&BUFF[loc], term, memory_order_relaxed);
-
 }
 
 static Pair take_pair(Loc loc) {
@@ -460,8 +455,6 @@ static void set_pair(Loc loc, Pair pair) {
   *((Pair*)&BUFF[loc]) = pair;
 }
 
-static Loc port(u64 n, Loc loc) { return n + loc - 1; }
-
 static Loc bbag_offset(u32 tid) {
   return tid * RBAG_LEN;
 }
@@ -478,7 +471,7 @@ static bool bbag_full(TM *tm) {
   return tm->bput == BBAG_LEN;
 }
 
-static bool bbag_compare_swap(u32 tid, u32 expect, u32 desire,
+static bool bbag_compare_swap(u32 tid, u64 expect, u32 desire,
                               memory_order success_order) {
   return atomic_compare_exchange_strong_explicit(&bbs[tid].ctrl, &expect,
       desire, success_order, memory_order_relaxed);
@@ -505,7 +498,7 @@ static void bbag_drop(TM *tm) {
   tm->bhld = false;
 }
 
-// Attempt to recover a tossed (stolen, and emptied) booty bag
+// Attempt to recover a stolen and emptied booty bag
 static bool bbag_recover(TM *tm) {
   bool held = bbag_get(tm->tid) == HELD;
   if (held) {
@@ -555,15 +548,32 @@ static bool bbag_steal(TM *tm, u32 sid) {
   return stole;
 }
 
-// Toss the booty bag we stole from another thread and emptied
-static void bbag_toss(TM *tm) {
-  #if defined(DEBUG)
-  if (bty_debug) {
-    fprintf(stderr, "%u tossing t%u's empty stolen bbag!\n", tm->tid, tm->sid);
-  }
-  #endif
+// Return true if booty bag is stolen, and empty
+static bool bbag_looted(TM *tm) {
+  return (tm->sid < TPC) && (tm->spop == 0);
+}
 
-  bbag_set(tm->sid, HELD, memory_order_relaxed);
+// Return a stolen, empty booty bag:
+// * if it was stolen stolen from another thread, mark it HELD
+// * reset tm->sid to indicate we're no longer stealing
+static void bbag_return(TM *tm) {
+  if (tm->sid != tm->tid) {
+    // It was another threads bag - reset state to HELD
+    bbag_set(tm->sid, HELD, memory_order_relaxed);
+    
+    #if defined(DEBUG)
+    if (bty_debug) {
+      fprintf(stderr, "%u tossing t%u's empty stolen bbag!\n", tm->tid, tm->sid);
+    }
+    #endif
+  } else {
+    #if 0 || defined(DEBUG)
+    if (bty_debug) {
+      fprintf(stderr, "%u emptied own stolen booty bag\n", tm->tid);
+    }
+    #endif
+  }
+  // No longer stealing
   tm->sid = TPC;
 }
 
@@ -579,24 +589,27 @@ static Loc rnod_ini(u32 tid) {
   return tid * NODE_LEN;
 }
 
-static Loc oflw_offset(u32 oidx) {
-  return OFLW_INI + OFLW_LEN * oidx;
+static Loc dfer_offset(u32 idx) {
+  return DFER_INI + DFER_LEN * idx;
 }
 
-static Loc oflw_ini(u32 tid, u32 oidx) {
-  return bbag_ini(tid) + oflw_offset(oidx);
+static Loc dfer_ini(u32 tid, u32 idx) {
+  return bbag_ini(tid) + dfer_offset(idx);
 }
 
-static bool oflw_empty(TM *tm) {
-  return (tm->oput[0] == 0) && (tm->oput[1] == 0);
+// Check if the sync'd deferred bag we might pop from is empty
+__attribute__((unused))
+static bool dfer_empty(TM *tm) {
+  return tm->dput[1u-tm->dpid] == 0;
+}  
+
+// Check if there are any items in either deferred bag
+static bool dfer_any(TM *tm) {
+  return (tm->dput[0] > 0) || (tm->dput[1] > 0);
 }  
 
 // Allocator
 // ---------
-
-static u64 align(u64 align, u64 val) {
-  return (val + align - 1) & ~(align - 1);
-}
 
 static Loc node_alloc(TM *tm, u32 cnt) {
   if (tm->nput + cnt >= NODE_LEN) {
@@ -610,18 +623,18 @@ static Loc node_alloc(TM *tm, u32 cnt) {
   return loc;
 }
 
-static Loc get_push_offset(TM *tm, bool force_oflw) {
-  if (force_oflw && tm->ouse) {
+static Loc get_push_offset(TM *tm, bool dfer) {
+  if (dfer && tm->duse) {
     #if defined(DEBUG)
-    if (oflw_debug) {
-      fprintf(stderr, "%u pushing to overflow %u @ %u\n", tm->tid,
-            0u+tm->opid, tm->oput[tm->opid]);
+    if (dfer_debug) {
+      fprintf(stderr, "%u pushing to deferred %u @ %u\n", tm->tid,
+            0u+tm->dpid, tm->dput[tm->dpid]);
     }
     #endif
 
-    u32 oput = tm->oput[tm->opid];
-    tm->oput[tm->opid] += 2;
-    return oflw_offset(tm->opid) + oput;
+    u32 dput = tm->dput[tm->dpid];
+    tm->dput[tm->dpid] += 2;
+    return dfer_offset(tm->dpid) + dput;
   }
 
   // Only push to booty bag if we aren't stealing
@@ -647,18 +660,29 @@ static Loc get_push_offset(TM *tm, bool force_oflw) {
   return BBAG_LEN + rput;
 }
 
-static void rbag_push(TM *tm, Term neg, Term pos, bool force_oflw) {
+static void redex_push(TM *tm, Term neg, Term pos, bool dfer) {
   #ifdef VOIDTEST
   if ((neg == 0) || (pos == 0)) {
-    fprintf(stderr, "%d rbag_push: void term\n", thread_id);
+    fprintf(stderr, "%d redex_push: void term\n", thread_id);
     exit_stacktrace();
   }
   #endif
 
-  Loc off = get_push_offset(tm, force_oflw);
+  Loc off = get_push_offset(tm, dfer);
   Loc loc = bbag_ini(tm->tid) + off;
 
   set_pair(loc, pair_new(neg, pos));
+
+  if (off < BBAG_LEN) {
+    // We pushed to booty bag
+    if (bbag_full(tm)) {
+      // We're holding a full, non-stolen booty bag - if there are terms in
+      // other bags available to pop immediately, drop it
+      if (!rbag_empty(tm) || dfer_any(tm)) {
+        bbag_drop(tm);
+      }
+    }
+  }
 
   #ifdef DEBUG
   if (off > BBAG_LEN) {
@@ -671,54 +695,55 @@ static void rbag_push(TM *tm, Term neg, Term pos, bool force_oflw) {
   #endif
 }
 
-_Thread_local u64 noflw = 0;
+//_Thread_local u64 noflw = 0;
 
-static Loc oflw_pop_loc(TM *tm) {
-  if (tm->osyn) {
-    // Overflow is sync'd so we can pop
-    u32 oidx = 1u - tm->opid;
-    if (tm->oput[oidx] > 0) {
-      tm->oput[oidx] -= 2;
+static Loc dfer_pop_loc(TM *tm) {
+  if (tm->dsyn) {
+    // Deferred bag is sync'd so we can pop
+    u32 dpid = 1u - tm->dpid;
+    if (tm->dput[dpid] > 0) {
+      tm->dput[dpid] -= 2;
       
       #if defined(DEBUG)
-      if (oflw_debug) {
-        fprintf(stderr, "%u popping from overflow %u @ %u\n", tm->tid,
-                oidx, tm->oput[oidx]);
+      if (dfer_debug) {
+        fprintf(stderr, "%u popping from deferred %u @ %u\n", tm->tid,
+                dpid, tm->dput[dpid]);
       }
       #endif
-      ++noflw;
+      //++noflw;
       
-      return oflw_ini(tm->tid, oidx) + tm->oput[oidx];
+      return dfer_ini(tm->tid, dpid) + tm->dput[dpid];
     } else {
-      tm->osyn = false;
+      tm->dsyn = false;
     }
   }
   return 0;
 }
 
-static void oflw_sync(TM *tm) {
+static void dfer_sync(TM *tm) {
 #ifdef __APPLE__
   dmb_ishst();
-#endif
-  tm->opid = 1u - tm->opid;
-  tm->osyn = true;
+#endif // __APPLE__
+  tm->dpid = 1u - tm->dpid;
+  tm->dsyn = true;
 }
 
 static Loc redex_pop_loc(TM* tm) {
-  // Check overflow bag first when sync'd
-  if (tm->ouse) {
-    Loc loc = oflw_pop_loc(tm);
+  // Check deferred bags first
+  if (tm->duse) {
+    Loc loc = dfer_pop_loc(tm);
     if (loc > 0) return loc;
 
-    if (tm->oput[tm->opid] > OFLW_SYNC) {
-      oflw_sync(tm);
-      Loc loc = oflw_pop_loc(tm);
+    // Flip & sync deferred bag if size has reached threshold
+    if (tm->dput[tm->dpid] > DFER_SYN) {
+      dfer_sync(tm);
+      Loc loc = dfer_pop_loc(tm);
       if (loc > 0) return loc;
     }
   }
     
   if ((tm->sid < TPC) && (tm->spop > 0)) {
-    // Pop from stolen non-empty booty bag - but it may be our HELD bag
+    // Pop from stolen booty bag - it may be our HELD bag
     tm->spop -= 2;
 
     // If we are stealing from our own bag, adjust push index as well
@@ -734,7 +759,7 @@ static Loc redex_pop_loc(TM* tm) {
 
     return bbag_ini(tm->sid) + tm->spop;
   } else if (tm->rput > 0) {
-    // Pop from non-empty RBAG
+    // Pop from RBAG
     tm->rput -= 2;
 
     #if 0 && defined(DEBUG)
@@ -742,12 +767,11 @@ static Loc redex_pop_loc(TM* tm) {
     #endif
 
     return rbag_ini(tm->tid) + tm->rput;
-  } else if (tm->ouse) {
-    // Finally, try a flip & sync of overflow bags
-    if (tm->oput[tm->opid] > 0) {
-      oflw_sync(tm);
-      Loc loc = oflw_pop_loc(tm);
-      if (loc > 0) return loc;
+  } else if (tm->duse) {
+    // Finally, try a flip & sync deferred bag with *any* elems
+    if (tm->dput[tm->dpid] > 0) {
+      dfer_sync(tm);
+      return dfer_pop_loc(tm);
     }
   }
   // Steal from someone else
@@ -760,22 +784,22 @@ void hvm_init() {
     BUFF = aligned_alloc(CACH_SIZ, HEAP_SIZ);
     if (BUFF == NULL) {
       fprintf(stderr, "Heap memory allocation failed\n");
-      exit(EXIT_FAILURE);
+      exit(1);
     }
   }
   memset(BUFF, 0, HEAP_SIZ);
 
   alloc_static_data();
 
-  #if 1
+  #ifdef SUMMARY
   fprintf(stderr, "HEAP_SIZ = %" PRIu64 "\n", HEAP_SIZ);
   fprintf(stderr, "RBAG_SIZ = %" PRIu64 "\n", RBAG_SIZ);
   fprintf(stderr, "RBAG     = %u\n", RBAG);
   fprintf(stderr, "RBAG_LEN = %u\n", RBAG_LEN);
   fprintf(stderr, "NODE_LEN = %u\n", NODE_LEN);
   fprintf(stderr, "BBAG_LEN = %u\n", BBAG_LEN);
-  fprintf(stderr, "OFLW_INI = %u\n", OFLW_INI);
-  fprintf(stderr, "OFLW_LEN = %" PRIu64 "\n", OFLW_LEN);
+  fprintf(stderr, "DFER_INI = %u\n", DFER_INI);
+  fprintf(stderr, "DFER_LEN = %" PRIu64 "\n", DFER_LEN);
   #endif
 
   #ifdef DEBUG
@@ -799,7 +823,7 @@ Loc ffi_alloc_node(u64 arity) {
 }
 
 void ffi_rbag_push(Term neg, Term pos) {
-  rbag_push(tms[0], neg, pos, false);
+  redex_push(tms[0], neg, pos, false);
 }
 
 u64 inc_itr() {
@@ -845,27 +869,27 @@ void def_new(char *name) {
   Loc rnod_cnt = tm->nput;
   Loc rbag_cnt = tm->rput;
 
-  u64 rbag_siz = align(CACH_SIZ, sizeof(Term) * rbag_cnt);
-  u64 rnod_siz = align(CACH_SIZ, sizeof(Term) * rnod_cnt);
+  u64 rbag_siz = sizeof(Term) * rbag_cnt;
+  u64 rnod_siz = sizeof(Term) * rnod_cnt;
 
   Def def = {
       .name = name,
-      .nodes = aligned_alloc(CACH_SIZ, rnod_siz),
+      .nodes = aligned_alloc(CACH_SIZ, align(CACH_SIZ, rnod_siz)),
       .nodes_len = rnod_cnt,
-      .rbag = aligned_alloc(CACH_SIZ, rbag_siz),
+      .rbag = aligned_alloc(CACH_SIZ, align(CACH_SIZ, rbag_siz)),
       .rbag_len = rbag_cnt,
   };
 
   if ((def.nodes == NULL) || (def.rbag == NULL)) {
-    fprintf(stderr, "DEF memory allocation failed\n");
+    fprintf(stderr, "def_new() memory allocation failed\n");
     exit(1);
   }
 
-  Term *nodes = BUFF;
+  Term *rnod = BUFF;
   Term *rbag = &BUFF[rbag_ini(0)];
 
-  memcpy(def.nodes, nodes, sizeof(Term) * def.nodes_len);
-  memcpy(def.rbag, rbag, sizeof(Term) * def.rbag_len);
+  memcpy(def.nodes, rnod, rnod_siz);
+  memcpy(def.rbag, rbag, rbag_siz);
 
   #if 0
   printf("NEW DEF '%s':\n", def.name);
@@ -873,13 +897,13 @@ void def_new(char *name) {
   printf("\n");
   #endif
 
-  memset(BUFF, 0, sizeof(Term) * def.nodes_len);
-  memset(rbag, 0, sizeof(Term) * def.rbag_len);
-
-  tm_reset(tm);
+  memset(rnod, 0, rnod_siz);
+  memset(rbag, 0, rbag_siz);
 
   BOOK.defs[BOOK.len] = def;
   BOOK.len++;
+
+  tm_reset(tm);
 }
 
 char *def_name(Loc def_idx) { return BOOK.defs[def_idx].name; }
@@ -913,7 +937,7 @@ static Term expand_ref(TM *tm, Loc def_idx) {
   for (u32 i = 0; i < rbag_len; i += 2) {
     Term neg = term_offset_loc(rbag[i], offset);
     Term pos = term_offset_loc(rbag[i+1], offset);
-    rbag_push(tm, neg, pos, false);
+    redex_push(tm, neg, pos, false);
   }
   return root;
 }
@@ -929,35 +953,25 @@ static void boot(Loc def_idx) {
 }
 
 // Atomic Linker
-
 static inline void move(TM *tm, Loc neg_loc, u64 pos);
-static inline void move_lvl(TM *tm, Loc neg_loc, Term pos, u32 lvl);
-
-static inline void link_lvl(TM *tm, Term neg, Term pos, u32 lvl) {
-  if (term_tag(pos) == VAR) {
-    Term far = swap_lvl(term_loc(pos), neg, lvl);
-    if (term_tag(far) != SUB) {
-      move_lvl(tm, term_loc(pos), far, lvl + 1);
-    }
-  } else {
-    rbag_push(tm, neg, pos, false);
-  }
-}
-
-static inline void move_lvl(TM *tm, Loc neg_loc, Term pos, u32 lvl) {
-  Term neg = swap_lvl(neg_loc, pos, lvl);
-  if (term_tag(neg) != SUB) {
-    // No need to take() since we already swapped
-    link_lvl(tm, neg, pos, lvl + 1);
-  }
-}
 
 static inline void link_terms(TM *tm, Term neg, Term pos) {
-  link_lvl(tm, neg, pos, 0);
+  if (term_tag(pos) == VAR) {
+    Term far = swap(term_loc(pos), neg);
+    if (term_tag(far) != SUB) {
+      move(tm, term_loc(pos), far);
+    }
+  } else {
+    redex_push(tm, neg, pos, false);
+  }
 }
 
 static inline void move(TM *tm, Loc neg_loc, Term pos) {
-  move_lvl(tm, neg_loc, pos, 0);
+  Term neg = swap(neg_loc, pos);
+  if (term_tag(neg) != SUB) {
+    // No need to take() since we already swapped
+    link_terms(tm, neg, pos);
+  }
 }
 
 // Interactions
@@ -971,8 +985,8 @@ static void interact_appref(TM *tm, Term neg, Loc pos_loc) {
     exit(1);
   }
   #endif
-  // Force push to overflow buffer
-  rbag_push(tm, neg, lam, true);
+  // Force push to deferred bag
+  redex_push(tm, neg, lam, true);
 }
 
 static void interact_applam(TM *tm, Loc a_loc, Loc b_loc) {
@@ -1348,8 +1362,6 @@ static void interact_dupref(TM *tm, Loc a_loc, Loc b_loc) {
 }
 
 static void interact_matnul(TM *tm, Loc a_loc, Lab mat_len) {
-  fprintf(stderr, "interact_matnul not supported (yet)\n");
-  exit(1);
   move(tm, port(1, a_loc), term_new(NUL, 0, 0));
   for (u32 i = 0; i < mat_len; i++) {
     link_terms(tm, term_new(ERA, 0, 0), take(port(i + 2, a_loc)));
@@ -1383,23 +1395,19 @@ static void interact_matnum(TM *tm, Loc mat_loc, Lab mat_len, u32 n, Tag n_type)
   }
 }
 
+// NOTE: not tested
 static void interact_matsup(TM *tm, Loc mat_loc, Lab mat_len, Loc sup_loc) {
-  fprintf(stderr, "interact_matsup not supported (yet)\n");
-  exit(1);
-  // TODO: convert to node_alloc( 2 + mat_len * 3)
-
-  /*
-  Loc ma0 = alloc_node(1 + mat_len);
-  Loc ma1 = alloc_node(1 + mat_len);
-  Loc sup = alloc_node(2);
+  Loc ma0 = node_alloc(tm, mat_len + 1);
+  Loc ma1 = node_alloc(tm, mat_len + 1);
+  Loc sup = node_alloc(tm, 2);
 
   set(port(1, sup), term_new(VAR, 0, port(1, ma1)));
   set(port(2, sup), term_new(VAR, 0, port(1, ma0)));
   set(port(1, ma0), term_new(SUB, 0, 0));
   set(port(1, ma1), term_new(SUB, 0, 0));
 
-  for (u64 i = 0; i < mat_len; i++) {
-    Loc dui = alloc_node(2);
+  for (u32 i = 0; i < mat_len; i++) {
+    Loc dui = node_alloc(tm, 2);
     set(port(1, dui), term_new(SUB, 0, 0));
     set(port(2, dui), term_new(SUB, 0, 0));
     set(port(2 + i, ma0), term_new(VAR, 0, port(2, dui)));
@@ -1411,7 +1419,6 @@ static void interact_matsup(TM *tm, Loc mat_loc, Lab mat_len, Loc sup_loc) {
   move(tm, port(1, mat_loc), term_new(SUP, 0, sup));
   link_terms(tm, term_new(MAT, mat_len, ma0), take(port(2, sup_loc)));
   link_terms(tm, term_new(MAT, mat_len, ma1), take(port(1, sup_loc)));
-  */
 }
 
 static void interact_eralam(TM *tm, Loc b_loc) {
@@ -1427,8 +1434,6 @@ static void interact_erasup(TM *tm, Loc b_loc) {
   link_terms(tm, term_new(ERA, 0, 0), tm1);
   link_terms(tm, term_new(ERA, 0, 0), tm2);
 }
-
-static char *tag_to_str(Tag tag);
 
 static bool interact(TM *tm, Term neg, Term pos) {
   Tag neg_tag = term_tag(neg);
@@ -1452,7 +1457,6 @@ static bool interact(TM *tm, Term neg, Term pos) {
       break;
     case REF:
       interact_appref(tm, neg, pos_loc);
-      //link_terms(tm, neg, expand_ref(tm, pos_loc);
       break;
     case SUP:
       interact_appsup(tm, neg_loc, pos_loc);
@@ -1519,11 +1523,9 @@ static bool interact(TM *tm, Term neg, Term pos) {
     case F32:
       interact_dupnum(tm, neg_loc, pos_loc, pos_tag);
       break;
-    // TODO(enricozb): dup-ref optimization
     case REF:
       interact_dupref(tm, neg_loc, pos_loc);
       break;
-    // case REF: link_terms(tm, neg, expand_ref(pos_loc)); break;
     case SUP:
       interact_dupsup(tm, neg_loc, pos_loc);
       break;
@@ -1614,11 +1616,8 @@ static bool sequential_step(TM* tm) {
   return true;
 }
  
-// don't allow idling if our booty bag isn't held
-// because it introduces weirdness that's easier to just ignore for now
- __attribute__((unused))
 static bool can_idle(TM *tm) {
-  return rbag_empty(tm) && bbag_empty(tm) && tm->bhld && oflw_empty(tm);
+  return rbag_empty(tm) && bbag_empty(tm) && !dfer_any(tm);
 }
  
 static bool set_idle(bool was_busy) {
@@ -1635,8 +1634,55 @@ static bool set_busy(bool was_busy) {
   return true;
 }
 
-static u32 get_victim(TM *tm) {
+#if 0
+    for (u64 i = 0; i < PCOR; i++) {
+      u32 vic = (tm->pvic - 1) % TPC;
+      if ((tm->smsk & (1 << vic)) == 0) {
+        tm->pvic = vic;
+        return tm->pvic;
+      }
+      tm->smsk |= (1 << vic);
+    }
+  }
+  tm->smsk &= ~(PCOR-1);
+  tm->pvic = tm->tid % PCOR;
+
+  // Fallback to ECore
+  //tm->evic = ((tm->evic - 1) % (TPC - PCOR)) + PCOR;
+  /*
+  if ((tm->smsk & ((TPC-PCOR-1) << PCOR)) == ((TPC-PCOR-1) << PCOR)) {
+    tm->smsk &= ~((TPC-PCOR-1) << (PCOR));
+  }
+  */
+  for (u64 i = 0; i < (TPC - PCOR); i++) {
+    u32 vic = ((tm->evic - 1) % (TPC - PCOR)) + PCOR;
+    if ((tm->smsk & (1 << vic)) == 0) {
+      tm->evic = vic;
+      return tm->evic;
+    }
+    tm->smsk |= (1 << vic);
+  }
+  tm->smsk &= ~((TPC-PCOR-1) << (PCOR));
+  tm->evic = (tm->tid % (TPC - PCOR)) + PCOR;
+
+  // We've failed all stealing from all threads consecutively - fallback to pvic
+
+  return tm->pvic;
+#endif
+
+static u32 get_victim(TM* tm) {
+#ifdef __APPLE__
+  // PCore bias: if we didn't fail last attempt, or we failed on ECore, try PCore
+  if ((tm->lvic == TPC) || (tm->lvic >= PCOR)) {
+    tm->pvic = (tm->pvic - 1) % PCOR;
+    return tm->pvic;
+  } else {
+    tm->evic = (tm->evic - 1) % ECOR + PCOR;
+    return tm->evic;
+  }
+#else
   return (tm->tid - 1) % TPC;
+#endif
 }
 
 static bool try_steal(TM *tm) {
@@ -1664,15 +1710,28 @@ static bool try_steal(TM *tm) {
   }
   // Our booty bag is either empty, or another thread stole it - try to steal
   // another thread's full bag
-  if (bbag_steal(tm, get_victim(tm))) {
+  u32 vic = get_victim(tm);
+  if (bbag_steal(tm, vic)) {
     tm->sgud += 1;
+    
+    if (tm->lvic < TPC) {
+      if (tm->scnt > tm->smax) {
+        tm->smax = tm->scnt;
+      }
+      tm->stot += tm->scnt;
+      tm->scnt = 0;
+    }
+
+    tm->lvic = TPC;
     return true;
   }
   tm->sbad += 1;
+  tm->lvic = vic;
+
+  tm->scnt += 1;
+
   return false;
 }
-
-#define IDLE 256
 
 static bool timeout(u64 tick) {
   if (tick % IDLE == 0) {
@@ -1684,41 +1743,60 @@ static bool timeout(u64 tick) {
   return false;
 }
 
-static bool lala_and_interact(TM *tm, Pair pair) {
-  if ((tm->sid < TPC) && (tm->spop == 0)) {
-    // The booty bag we stole just became empty
-    if (tm->sid != tm->tid) {
-      // It was another threads bag - toss it
-      bbag_toss(tm);
-    } else {
-      #if 0 || defined(DEBUG)
-      if (bty_debug) {
-        fprintf(stderr, "%u emptied own stolen booty bag\n", tm->tid);
-      }
-      #endif
-    }
-    // No longer stealing
-    tm->sid = TPC;
-  }
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <mach/thread_policy.h>
 
-  return interact(tm, pair_neg(pair), pair_pos(pair));
+void set_affinity(int tid) {
+  thread_affinity_policy_data_t policy;
+  policy.affinity_tag = tid; // 0-3 for P-cores, 4-9 for E-cores
+  thread_policy_set(mach_thread_self(), THREAD_AFFINITY_POLICY,
+                    (thread_policy_t)&policy, THREAD_AFFINITY_POLICY_COUNT);
 }
+
+void bind_pcore(int tid) {
+    // Set high QoS
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    set_affinity(tid);
+}
+
+void bind_ecore(int tid) {
+    // Set lower QoS
+    pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+    set_affinity(tid);
+}
+
+static void bind_core(int tid) {
+  if (tid < PCOR) {
+    bind_pcore(tid);
+  } else {
+    bind_ecore(tid);
+  }
+}
+#endif // __APPLE__
 
 static void* thread_func(void* arg) {
   thread_id = (u64)arg;
+
+#ifdef __APPLE__
+  bind_core(thread_id);
+#endif
   TM *tm = tms[thread_id];
 
   // Wait until after injection to turn these on
   tm->buse = true;
-  tm->ouse = true;
+  tm->duse = true;
   //u64 do_nothing = 0;
 
+  __attribute__((unused))
+  u64  fst_steal = 0;
   u64  tick = 0;
   bool busy = tm->tid == 0;
   while (true) {
     tick += 1;
 
-    // Try to recover stolen and emptied booty bag
+    // If we know we're not holding our own booty bag, it may have been stolen
+    // and returned - try to recover it
     if (!tm->bhld) {
       bbag_recover(tm);
     }
@@ -1728,35 +1806,34 @@ static void* thread_func(void* arg) {
       busy = set_busy(busy);
       
       Pair pair = take_pair(loc);
-      lala_and_interact(tm, pair);
-
-      #if 1
-      if (tm->bhld && (tm->sid == TPC) && bbag_full(tm)) {
-        // We're holding a full, non-stolen booty bag. Consider dropping it.
-        if (!rbag_empty(tm) || !oflw_empty(tm)) {
-          bbag_drop(tm);
-        }
+      
+      // If we just emptied a stolen bag, return it
+      if (bbag_looted(tm)) {
+        bbag_return(tm);
       }
-      #endif
+
+      interact(tm, pair_neg(pair), pair_pos(pair));
     } else {
       //do_nothing += 1;
       if (busy && can_idle(tm)) {
         busy = set_idle(busy);
       }
-      if (!try_steal(tm) && !busy) {
+      if (!try_steal(tm)) {
         sched_yield();
-        if (timeout(tick))
+        if (!busy && timeout(tick))
           break;
       }
+      #if 1
+      else if (tm->sgud == 1) {
+        fst_steal = tick;
+      }
+      #endif
     }
   }
 
-  //atomic_fetch_add(&net.nods, tm->nput);
-  //atomic_fetch_add(&net.itrs, tm->itrs);
-
   #ifdef SUMMARY
-  fprintf(stderr, "t%u itrs %" PRIu64 ", steals good %u bad %u oflw %" PRIu64 "\n"); // do_nothing %" PRIu64 "\n",
-          tm->tid, tm->itrs, tm->sgud, tm->sbad, noflw);//, do_nothing);
+  fprintf(stderr, "t%u itrs %" PRIu64 ", steals gud %u bad %u fst %" PRIu64 " max %hu tot %hu\n",
+          tm->tid, tm->itrs, tm->sgud, tm->sbad, fst_steal, tm->smax, tm->stot);
   #endif
   return NULL;
 }
@@ -1788,16 +1865,11 @@ Term normalize(Term term) {
     TM *tm = tms[0];
     while (sequential_step(tm))
       ;
-    net.nods = tm->nput;
-    net.itrs = tm->itrs;
   } else {
     parallel_normalize();
   }
 
   return get(0);
-}
-
-void handle_failure() {
 }
 
 // Debugging
@@ -1839,6 +1911,13 @@ static char *tag_to_str(Tag tag) {
   default:
     return "???";
   }
+}
+
+__attribute__((unused))
+static const char* term_str(char* buf, Term term) {
+  snprintf(buf, 64, "%s lab:%u loc:%u", tag_to_str(term_tag(term)),
+           term_lab(term), term_loc(term));
+  return buf;
 }
 
 static void dump_term(Loc loc) {
