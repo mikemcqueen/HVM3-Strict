@@ -32,7 +32,6 @@ extractPCore term = case termTag term of
   U32 -> return $ PU32 (termLoc term)
   I32 -> return $ PI32 (word32ToInt32 $ termLoc term)
   F32 -> return $ PF32 (word32ToFloat $ termLoc term)
-  tag -> error $ "extractPCore: unhandled case: " ++ show tag
 
 -- Convert a term in memory to a NCore.
 -- The optional location is the location of the term
@@ -70,7 +69,6 @@ extractNCore loc term = case termTag term of
     arg' <- extractPCore arg
     ret' <- extractNCore (loc + 1) ret
     return $ NOp2 op arg' ret'
-  tag -> error $ "extractNCore: unhandled case: " ++ show tag
 
 extractVar :: Loc -> Term -> IO PCore
 extractVar loc term = case termTag term of
@@ -101,7 +99,6 @@ extractDex loc = do
 extractBag :: [Loc] -> IO Bag
 extractBag [] = return []
 extractBag (loc:locs) = do
-  putStrLn $ "extractBag "
   dex  <- extractDex loc
   dexs <- extractBag locs
   return (dex : dexs)
