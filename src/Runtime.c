@@ -16,43 +16,12 @@
 #include <string.h>
 #include <unistd.h>
 
-#define SUMMARY
+//#define SUMMARY
 //#define DEBUG
-//#define VOIDTEST
 
 #define DEBUG_LOG(fmt, ...) fprintf(stderr, "[DEBUG] " fmt "\n", ##__VA_ARGS__)
 
-int get_num_threads() {
-  long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
-  return (nprocs <= 1) ? 1 : 1 << (int)log2(nprocs);
-}
-
-void exit_stacktrace() {
-  void *array[10];
-  size_t size;
-  
-  size = backtrace(array, 10);
-  backtrace_symbols_fd(array, size, STDERR_FILENO);
-  exit(1);
-}
-
-void segv_handler(int sig) {
-  fprintf(stderr, "Error: signal %d:\n", sig);
-  exit_stacktrace();
-}
-
 #ifdef __APPLE__
-// Use explicit file-scope assembly to prevent compiler from optimizing out
-extern uint64_t read_cntvct(void);
-__asm__(
-    ".global _read_cntvct\n"
-    ".global read_cntvct\n"
-    "_read_cntvct:\n"
-    "read_cntvct:\n"
-    "   mrs x0, cntvct_el0\n"
-    "   ret\n"
-);
-
 // Store barrier
 extern void dmb_ishst(void);
 __asm__(
@@ -141,13 +110,13 @@ enum : u64 {
   // Threads per CPU
   TPC = 10,
 
-#ifdef __APPLE__
+  #ifdef __APPLE__
   // PCores and ECores total, and in-use
   PCOR_TOT = 4,
   ECOR_TOT = TPC - PCOR_TOT,
   PCOR = TPC < PCOR_TOT ? TPC : PCOR_TOT,
   ECOR = TPC > PCOR_TOT ? (TPC - PCOR) : 0,
-#endif
+  #endif
 
   // Misc
   ZERO = 0,
@@ -209,31 +178,27 @@ typedef struct TM {
   u32 tid;   // thread id
   Loc nput;  // next node allocation attempt index
   Loc rput;  // next rbag push index
-  u32 sid;   // tid from which bbag was stolen
   Loc bput;  // owned bbag push index
-  Loc spop;  // stolen bbag pop index + 2
 
-  u32 sgud;  // successful steal count
-  u32 sbad;  // failed steal count
+  u32 sid;   // tid from which bbag was stolen (may be our own)
+  Loc spop;  // stolen bbag pop index + 2
 
   Loc dput[2]; // next deferred bag push indices
   
-  uint16_t scnt;
-  uint16_t smax;
-  uint16_t stot;
-  uint16_t smsk;
-
   bool buse; // can use booty bag
   bool bhld; // when we KNOW booty bag ctrl word is HELD
              // (in some cases it may be HELD but we don't know)
 
-  u8   dpid; // dput idx we are pushing into
+  u8   dpid; // deferred bag idx we are pushing into
   bool duse; // can use deferred bag
   bool dsyn; // deferred bag is sync'd
 
-  u8   lvic;
-  u8   pvic;
-  u8   evic;
+  u8   lvic; // last failed steal attempt victim
+
+#ifdef __APPLE__
+  u8   pvic; // last failed PCore victim
+  u8   evic; // last failed ECore victim
+#endif // __APPLE__
 
   u64 itrs;  // interaction count
 } TM;
@@ -264,20 +229,10 @@ static Book BOOK = {
 static TM *tms[TPC];
 static BB bbs[TPC];
 static pthread_t threads[TPC];
-#ifdef DEBUG
-static uint8_t unprocessed_itrs[255] = { 0 };
-#endif
-
-static _Thread_local int thread_id = 0;
 
 // Debugging
 static char *tag_to_str(Tag tag);
 static const char* term_str(char* buf, Term term);
-
-__attribute__((unused))
-static int bty_debug = 0; // booty bag
-__attribute__((unused))
-static int dfer_debug = 0; // deferred bag
 
 // FFI functions
 void dump_buff();
@@ -296,7 +251,6 @@ void tm_reset(TM *tm) {
 }
 
 TM *tm_new(u64 tid) {
-  // make size a multiple of alignment
   TM *tm = aligned_alloc(CACH_SIZ, align(CACH_SIZ, sizeof(TM)));
   if (tm == NULL) {
     fprintf(stderr, "tm_new() memory allocation failed\n");
@@ -314,8 +268,6 @@ TM *tm_new(u64 tid) {
   // Stolen booty bag
   tm->sid = TPC;
   tm->spop = 0;
-  tm->sgud = 0;
-  tm->sbad = 0;
 
   // Deferred bag
   tm->dput[0] = 0;
@@ -324,15 +276,12 @@ TM *tm_new(u64 tid) {
   tm->duse = false;
   tm->dsyn = false;
 
-  // Last steal attempt thread ids
+  // Last failed steal attempt thread ids
   tm->lvic = TPC;
+#ifdef __APPLE__
   tm->pvic = tid % PCOR;
   tm->evic = (tid % ECOR) + PCOR;
-
-  tm->scnt = 0;
-  tm->smax = 0;
-  tm->stot = 0;
-  tm->smsk = 0;
+#endif // __APPLE__
 
   return tm;
 }
@@ -393,32 +342,15 @@ static Loc port(u32 n, Loc loc) { return n + loc - 1; }
 
 // Memory operations
 Term swap(Loc loc, Term term) {
-  Term got = atomic_exchange_explicit((a64*)&BUFF[loc], term, memory_order_relaxed);
-
-  #ifdef VOIDTEST
-  if (got == 0) {
-    fprintf(stderr, "%d swap got NULL @ %u\n", thread_id, loc);
-    exit_stacktrace();
-  }
-  #endif
-  return got;
+  return atomic_exchange_explicit((a64*)&BUFF[loc], term, memory_order_relaxed);
 }
 
 Term take(Loc loc) {
-  Term term = atomic_exchange_explicit((a64*)&BUFF[loc], ZERO, memory_order_relaxed);
-
-  #ifdef VOIDTEST
-  if (term == 0) {
-    fprintf(stderr, "%d take got NULL @ %u\n", thread_id, loc);
-    exit_stacktrace();
-  }
-  #endif
-  return term;
+  return atomic_exchange_explicit((a64*)&BUFF[loc], ZERO, memory_order_relaxed);
 }
 
 Term get(Loc loc) {
-  Term term = atomic_load_explicit((a64*)&BUFF[loc], memory_order_relaxed);
-  return term;
+  return atomic_load_explicit((a64*)&BUFF[loc], memory_order_relaxed);
 }
 
 void set(Loc loc, Term term) {
@@ -426,32 +358,10 @@ void set(Loc loc, Term term) {
 }
 
 static Pair take_pair(Loc loc) {
-  Pair pair = *(Pair*)&BUFF[loc];
-  
-  // Debugging
-  #if defined(VOIDTEST)
-  Term neg = pair_neg(pair);
-  Term pos = pair_pos(pair);
-  //*(Pair*)&BUFF[loc] = (Pair)ZERO;
-  if ((neg == 0) || (pos == 0)) {
-    fprintf(stderr, "%d take_pair: void term taken\n", thread_id);
-    exit_stacktrace();
-  }
-  #endif
-  
-  return pair;
+  return *(Pair*)&BUFF[loc];
 }
 
 static void set_pair(Loc loc, Pair pair) {
-  #ifdef VOIDTEST
-  Term neg = pair_neg(pair);
-  Term pos = pair_pos(pair);
-  if ((neg == 0) || (pos == 0)) {
-    fprintf(stderr, "%d set_pair: void term\n", thread_id);
-    exit_stacktrace();
-  }
-  #endif
-
   *((Pair*)&BUFF[loc]) = pair;
 }
 
@@ -487,13 +397,6 @@ static u32 bbag_get(u32 tid) {
 
 // Drop a held, full booty bag (make it steal-able)
 static void bbag_drop(TM *tm) {
-  #if defined(DEBUG)
-  if (bty_debug) {
-    fprintf(stderr, "%u dropping bbag! bput %u rput %u\n",
-            tm->tid, tm->bput, tm->rput);
-  }
-  #endif
-
   bbag_set(tm->tid, DROPPED, memory_order_release);
   tm->bhld = false;
 }
@@ -504,12 +407,6 @@ static bool bbag_recover(TM *tm) {
   if (held) {
     tm->bhld = true;
     tm->bput = 0;
-
-    #if defined(DEBUG)
-    if (bty_debug) {
-      fprintf(stderr, "%u recovered empty stolen bbag!\n", tm->tid);
-    }
-    #endif
   }
   return held;
 }
@@ -522,12 +419,6 @@ static bool bbag_pickup(TM *tm) {
     tm->bhld = true;
     tm->spop = tm->bput; // will always be BBAG_LEN
     tm->sid = tm->tid;
-
-    #if defined(DEBUG)
-    if (bty_debug) {
-      fprintf(stderr, "%d picked up our own dropped bbag!\n", tm->tid);
-    }
-    #endif
   }
   return held;
 }
@@ -538,12 +429,6 @@ static bool bbag_steal(TM *tm, u32 sid) {
   if (stole) {
     tm->spop = BBAG_LEN;
     tm->sid = sid;
-    
-    #if defined(DEBUG)
-    if (bty_debug) {
-      fprintf(stderr, "%d stole t%u's bbag!\n", tm->tid, sid);
-    }
-    #endif
   }
   return stole;
 }
@@ -553,25 +438,11 @@ static bool bbag_looted(TM *tm) {
   return (tm->sid < TPC) && (tm->spop == 0);
 }
 
-// Return a stolen, empty booty bag:
-// * if it was stolen stolen from another thread, mark it HELD
-// * reset tm->sid to indicate we're no longer stealing
+// Return a stolen, empty booty bag
 static void bbag_return(TM *tm) {
   if (tm->sid != tm->tid) {
-    // It was another threads bag - reset state to HELD
+    // It was another thread's bag - reset state to HELD
     bbag_set(tm->sid, HELD, memory_order_relaxed);
-    
-    #if defined(DEBUG)
-    if (bty_debug) {
-      fprintf(stderr, "%u tossing t%u's empty stolen bbag!\n", tm->tid, tm->sid);
-    }
-    #endif
-  } else {
-    #if 0 || defined(DEBUG)
-    if (bty_debug) {
-      fprintf(stderr, "%u emptied own stolen booty bag\n", tm->tid);
-    }
-    #endif
   }
   // No longer stealing
   tm->sid = TPC;
@@ -624,14 +495,8 @@ static Loc node_alloc(TM *tm, u32 cnt) {
 }
 
 static Loc get_push_offset(TM *tm, bool dfer) {
+  // Push to deferred bag
   if (dfer && tm->duse) {
-    #if defined(DEBUG)
-    if (dfer_debug) {
-      fprintf(stderr, "%u pushing to deferred %u @ %u\n", tm->tid,
-            0u+tm->dpid, tm->dput[tm->dpid]);
-    }
-    #endif
-
     u32 dput = tm->dput[tm->dpid];
     tm->dput[tm->dpid] += 2;
     return dfer_offset(tm->dpid) + dput;
@@ -639,21 +504,11 @@ static Loc get_push_offset(TM *tm, bool dfer) {
 
   // Only push to booty bag if we aren't stealing
   if (tm->buse && tm->bhld && !bbag_full(tm) && (tm->sid == TPC)) {
-    #if defined(DEBUG)
-    if (bty_debug) {
-      fprintf(stderr, "%u pushing to booty bag @ %u\n", tm->tid, tm->bput);
-    }
-    #endif
-
     u32 bput = tm->bput;
     tm->bput += 2;
     return bput;
   }
 
-  #if 0 && defined(DEBUG)
-  fprintf(stderr, "%u pushing to RBAG @ %u buse %u\n", tm->tid,
-          tm->rput, (u32)tm->buse);
-  #endif
   // Push to RBAG
   u32 rput = tm->rput;
   tm->rput += 2;
@@ -661,13 +516,6 @@ static Loc get_push_offset(TM *tm, bool dfer) {
 }
 
 static void redex_push(TM *tm, Term neg, Term pos, bool dfer) {
-  #ifdef VOIDTEST
-  if ((neg == 0) || (pos == 0)) {
-    fprintf(stderr, "%d redex_push: void term\n", thread_id);
-    exit_stacktrace();
-  }
-  #endif
-
   Loc off = get_push_offset(tm, dfer);
   Loc loc = bbag_ini(tm->tid) + off;
 
@@ -695,23 +543,12 @@ static void redex_push(TM *tm, Term neg, Term pos, bool dfer) {
   #endif
 }
 
-//_Thread_local u64 noflw = 0;
-
 static Loc dfer_pop_loc(TM *tm) {
   if (tm->dsyn) {
     // Deferred bag is sync'd so we can pop
     u32 dpid = 1u - tm->dpid;
     if (tm->dput[dpid] > 0) {
       tm->dput[dpid] -= 2;
-      
-      #if defined(DEBUG)
-      if (dfer_debug) {
-        fprintf(stderr, "%u popping from deferred %u @ %u\n", tm->tid,
-                dpid, tm->dput[dpid]);
-      }
-      #endif
-      //++noflw;
-      
       return dfer_ini(tm->tid, dpid) + tm->dput[dpid];
     } else {
       tm->dsyn = false;
@@ -750,22 +587,10 @@ static Loc redex_pop_loc(TM* tm) {
     if (tm->sid == tm->tid) {
       tm->bput -= 2;
     }
-
-    #if defined(DEBUG)
-    if (bty_debug) {
-      fprintf(stderr, "%u popping from booty bag @ %u\n", tm->tid, tm->spop);
-    }
-    #endif
-
     return bbag_ini(tm->sid) + tm->spop;
   } else if (tm->rput > 0) {
     // Pop from RBAG
     tm->rput -= 2;
-
-    #if 0 && defined(DEBUG)
-    fprintf(stderr, "%u popping from RBAG @ %u\n", tm->tid, tm->rput);
-    #endif
-
     return rbag_ini(tm->tid) + tm->rput;
   } else if (tm->duse) {
     // Finally, try a flip & sync deferred bag with *any* elems
@@ -801,10 +626,6 @@ void hvm_init() {
   fprintf(stderr, "DFER_INI = %u\n", DFER_INI);
   fprintf(stderr, "DFER_LEN = %" PRIu64 "\n", DFER_LEN);
   #endif
-
-  #ifdef DEBUG
-  signal(SIGSEGV, segv_handler);
-  #endif
 }
 
 void hvm_free() {
@@ -813,6 +634,9 @@ void hvm_free() {
     BUFF = NULL;
   }
   free_static_data();
+}
+
+void handle_failure() {
 }
 
 Loc ffi_alloc_node(u64 arity) {
@@ -1441,8 +1265,6 @@ static bool interact(TM *tm, Term neg, Term pos) {
   Loc neg_loc = term_loc(neg);
   Loc pos_loc = term_loc(pos);
 
-  //bool processed = true;
-
   switch (neg_tag) {
   case APP:
     switch (pos_tag) {
@@ -1462,7 +1284,6 @@ static bool interact(TM *tm, Term neg, Term pos) {
       interact_appsup(tm, neg_loc, pos_loc);
       break;
     default:
-      //processed = false;
       break;
     }
     break;
@@ -1484,7 +1305,6 @@ static bool interact(TM *tm, Term neg, Term pos) {
       break;
     case LAM:
     default:
-      //processed = false;
       break;
     }
     break;
@@ -1506,7 +1326,6 @@ static bool interact(TM *tm, Term neg, Term pos) {
       break;
     case LAM:
     default:
-      //processed = false;
       break;
     }
     break;
@@ -1530,7 +1349,6 @@ static bool interact(TM *tm, Term neg, Term pos) {
       interact_dupsup(tm, neg_loc, pos_loc);
       break;
     default:
-      //processed = false;
       break;
     }
     break;
@@ -1552,7 +1370,6 @@ static bool interact(TM *tm, Term neg, Term pos) {
       break;
     case LAM:
     default:
-      //processed = false;
       break;
     }
     break;
@@ -1568,43 +1385,15 @@ static bool interact(TM *tm, Term neg, Term pos) {
     case U32:
     case REF:
     default:
-      //processed = false;
       break;
     }
     break;
   default:
-    //processed = false;
     break;
   }
   tm->itrs += 1;
-
-  #if defined(DEBUG)
-  if (!processed) {
-    unprocessed_itrs[neg_tag * 16 + pos_tag] = 1;
-    return false;
-  }
-  #endif
-
   return true;
 }
-
-#ifdef DEBUG
-static void show_unprocessed_itrs() {
-  for (u32 i = 17; i <= 255; i++) {
-    u32 pos_tag = i % 16;
-    if (pos_tag < 1) continue;
-    u32 neg_tag = i / 16;
-    bool hdr = true;
-    if (unprocessed_itrs[neg_tag*16 + pos_tag]) {
-      if (hdr) {
-        fprintf(stderr, "Unprocesed itrs:\n");
-        hdr = false;
-      }
-      fprintf(stderr, "%s%s\n", tag_to_str(neg_tag), tag_to_str(pos_tag));
-    }
-  }
-}
-#endif
 
 static bool sequential_step(TM* tm) {
   Loc loc = redex_pop_loc(tm);
@@ -1634,42 +1423,6 @@ static bool set_busy(bool was_busy) {
   return true;
 }
 
-#if 0
-    for (u64 i = 0; i < PCOR; i++) {
-      u32 vic = (tm->pvic - 1) % TPC;
-      if ((tm->smsk & (1 << vic)) == 0) {
-        tm->pvic = vic;
-        return tm->pvic;
-      }
-      tm->smsk |= (1 << vic);
-    }
-  }
-  tm->smsk &= ~(PCOR-1);
-  tm->pvic = tm->tid % PCOR;
-
-  // Fallback to ECore
-  //tm->evic = ((tm->evic - 1) % (TPC - PCOR)) + PCOR;
-  /*
-  if ((tm->smsk & ((TPC-PCOR-1) << PCOR)) == ((TPC-PCOR-1) << PCOR)) {
-    tm->smsk &= ~((TPC-PCOR-1) << (PCOR));
-  }
-  */
-  for (u64 i = 0; i < (TPC - PCOR); i++) {
-    u32 vic = ((tm->evic - 1) % (TPC - PCOR)) + PCOR;
-    if ((tm->smsk & (1 << vic)) == 0) {
-      tm->evic = vic;
-      return tm->evic;
-    }
-    tm->smsk |= (1 << vic);
-  }
-  tm->smsk &= ~((TPC-PCOR-1) << (PCOR));
-  tm->evic = (tm->tid % (TPC - PCOR)) + PCOR;
-
-  // We've failed all stealing from all threads consecutively - fallback to pvic
-
-  return tm->pvic;
-#endif
-
 static u32 get_victim(TM* tm) {
 #ifdef __APPLE__
   // PCore bias: if we didn't fail last attempt, or we failed on ECore, try PCore
@@ -1695,14 +1448,9 @@ static bool try_steal(TM *tm) {
       // We're holding it, so we can "steal" (from) it without atomics
       tm->spop = tm->bput;
       tm->sid = tm->tid;
-
-      #if 0 || defined(DEBUG)
-      if (bty_debug) {
-        fprintf(stderr, "%u stealing from own held bbag!\n", tm->tid);
-      }
-      #endif
       return true;
     } else {
+      // We dropped it - try to pick it up
       if (bbag_pickup(tm)) {
         return true;
       }
@@ -1712,24 +1460,10 @@ static bool try_steal(TM *tm) {
   // another thread's full bag
   u32 vic = get_victim(tm);
   if (bbag_steal(tm, vic)) {
-    tm->sgud += 1;
-    
-    if (tm->lvic < TPC) {
-      if (tm->scnt > tm->smax) {
-        tm->smax = tm->scnt;
-      }
-      tm->stot += tm->scnt;
-      tm->scnt = 0;
-    }
-
     tm->lvic = TPC;
     return true;
   }
-  tm->sbad += 1;
   tm->lvic = vic;
-
-  tm->scnt += 1;
-
   return false;
 }
 
@@ -1776,7 +1510,7 @@ static void bind_core(int tid) {
 #endif // __APPLE__
 
 static void* thread_func(void* arg) {
-  thread_id = (u64)arg;
+  int thread_id = (u64)arg;
 
 #ifdef __APPLE__
   bind_core(thread_id);
@@ -1823,18 +1557,13 @@ static void* thread_func(void* arg) {
         if (!busy && timeout(tick))
           break;
       }
-      #if 1
-      else if (tm->sgud == 1) {
-        fst_steal = tick;
-      }
-      #endif
     }
   }
 
   #ifdef SUMMARY
-  fprintf(stderr, "t%u itrs %" PRIu64 ", steals gud %u bad %u fst %" PRIu64 " max %hu tot %hu\n",
-          tm->tid, tm->itrs, tm->sgud, tm->sbad, fst_steal, tm->smax, tm->stot);
+  fprintf(stderr, "t%u itrs %" PRIu64 "\n", tm->tid, tm->itrs);
   #endif
+
   return NULL;
 }
 
@@ -1847,10 +1576,6 @@ static void parallel_normalize() {
   for (u64 i = 0; i < TPC; i++) {
     pthread_join(threads[i], NULL);
   }
-
-  #ifdef DEBUG
-  show_unprocessed_itrs();
-  #endif
 }
 
 Term normalize(Term term) {
