@@ -16,7 +16,7 @@
 #include <string.h>
 #include <unistd.h>
 
-//#define SUMMARY
+#define SUMMARY
 //#define DEBUG
 //#define MEMLOG
 
@@ -290,7 +290,7 @@ enum : u32 {
 #define MLOG(mop, loc, t1, t2)
 #define MLOG_PAIR(mop, loc, pair)
 #define MLOG_LVL(mop, loc, lvl, t1, t2)
-#endif
+#endif // MEMLOG 
 
 __attribute__((unused))
 static u32 u64_hi(u64 e) {
@@ -642,12 +642,12 @@ static int bty_debug = 1; // booty bag
 Term swap_lvl(Loc loc, Term term, u32 lvl) {
   Term got = atomic_exchange_explicit((a64*)&BUFF[loc], term, memory_order_relaxed);
   MLOG_LVL(MOP_EXCH, loc, lvl, got, term);
-#if 1
+  #if 0
   if (got == 0) {
     fprintf(stderr, "%d swap got NULL @ %u\n", thread_id, loc);
     mlog_exit();
   }
-#endif
+  #endif
   return got;
 }
 
@@ -658,10 +658,12 @@ Term swap(Loc loc, Term term) {
 Term take(Loc loc) {
   Term term = atomic_exchange_explicit((a64*)&BUFF[loc], ZERO, memory_order_relaxed);
   MLOG(MOP_EXCH, loc, term, 0);
+  #if 0
   if (term == 0) {
     fprintf(stderr, "%d take got NULL @ %u\n", thread_id, loc);
     mlog_exit();
   }
+  #endif
   return term;
 }
 
@@ -695,13 +697,13 @@ static Pair take_pair(Loc loc) {
 #endif
   MLOG_PAIR(MOP_LOAD, loc, pair);
 
-#ifdef VOID_TEST
+  #ifdef VOID_TEST
   //*(Pair*)&BUFF[loc] = (Pair)ZERO;
   if ((neg == 0) || (pos == 0)) {
     fprintf(stderr, "%d take_pair: void term taken\n", thread_id);
     mlog_exit();
   }
-#endif
+  #endif
   
   return pair;
 }
