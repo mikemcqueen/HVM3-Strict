@@ -267,6 +267,7 @@ static const char* term_str(char* buf, Term term);
 
 // FFI functions
 void dump_buff();
+static void dump_term(Loc loc);
 Tag term_tag(Term term) { return term & 0xFF; }
 Loc term_loc(Term term);
 
@@ -282,7 +283,6 @@ enum : u32 {
   MLOG_LEN = MLOG_SIZ / (TPC * sizeof(u64))
 };
 
-//static _Thread_local u64 rbag_loc = 0;
 #define MLOG(mop, loc, t1, t2)          mlog((u32)thread_id, mop, loc, t1, t2, 0)
 #define MLOG_PAIR(mop, loc, pair)       mlog_pair((u32)thread_id, mop, loc, pair)
 #define MLOG_LVL(mop, loc, lvl, t1, t2) mlog((u32)thread_id, mop, loc, t1, t2, lvl)
@@ -472,7 +472,7 @@ static u64 mlog_get_word(u32 idx, TM *tm, u32 mop, Loc loc, u32 lvl, Term t1, Te
   case 0: return read_cntvct();
   case 1: return mlog_entry(tm->tid, mop, tm->itid, loc, lvl, tm->i1_tag,
                             tm->i2_tag, term_tag(t1), term_tag(t2));
-  case 2: return (u64)term_loc(t1) << 32 | term_loc(t2); // TODO new_u64()
+  case 2: return (u64)term_loc(t1) << 32 | term_loc(t2);
   default:
     break;
   }
@@ -932,6 +932,8 @@ static Loc redex_pop_loc(TM* tm) {
     tm->spop -= 2;
 
     // If we are stealing from our own bag, adjust push index as well
+    // NOTE shouldn't be necessary here as we are committed to emptying
+    // the bag, thus could set bput=0 when bag becomes empty.
     if (tm->sid == tm->tid) {
       tm->bput -= 2;
     }
@@ -941,7 +943,7 @@ static Loc redex_pop_loc(TM* tm) {
     tm->rput -= 2;
     return rbag_ini(tm->tid) + tm->rput;
   } else if (tm->duse) {
-    // Finally, try a flip & sync deferred bag with *any* elems
+    // Finally, try flip & sync of deferred bag with size > 0
     if (tm->dput[tm->dpid] > 0) {
       dfer_sync(tm);
       return dfer_pop_loc(tm);
@@ -1090,38 +1092,122 @@ void def_new(char *name) {
 
 char *def_name(Loc def_idx) { return BOOK.defs[def_idx].name; }
 
+static Term node_offset_loc(Term term, Loc* nod_locs) {
+  if (!term_has_loc(term)) { return term; }
+  Loc loc = term_loc(term);
+  Loc nloc = (loc - 1) / 2;
+  Loc off = (loc - 1) & 1;
+  return term_with_loc(term, nod_locs[nloc] + off);
+}
+
+// side by side
+static void disp_sbs(Term t1, Loc loc1, Term t2, Loc loc2) {
+  fprintf(stderr, "%04u %s %03u %03u    %04u %s %03u %03u\n",
+         loc1, tag_to_str(term_tag(t1)), term_loc(t1), term_lab(t1), 
+         loc2, tag_to_str(term_tag(t2)), term_loc(t2), term_lab(t2));
+}
+
+static void disp_terms(Term root1, Term root2, Loc *node_locs, u32 loc_cnt, bool mat) {
+  fprintf(stderr, "ADDR TAG LOC LAB    ADDR TAG LOC LAB\n");
+  fprintf(stderr, "----------------    ----------------\n");
+  disp_sbs(root1, 0, root2, 0);
+  for (u32 i = 0; i < loc_cnt; i++) {
+    Loc loc1 = node_locs[i];
+    Loc loc2 = mat ? node_locs[i] : node_locs[loc_cnt + i];
+    disp_sbs(BUFF[loc1], loc1, BUFF[loc2], loc2);
+    disp_sbs(BUFF[loc1+1], loc1+1, BUFF[loc2+1], loc2+1);
+  }
+}
+
 // Expands a ref's data into a linear block of nodes with its nodes' locs
 // offset by the index where in the BUFF it was expanded.
 //
 // Returns the ref's root, the first node in its data.
 static Term expand_ref(TM *tm, Loc def_idx) {
   // Get definition data
-  const Def* def = &BOOK.defs[def_idx];
+  const Def *def = &BOOK.defs[def_idx];
   const u32 nodes_len = def->nodes_len;
   const Term *nodes = def->nodes;
   const Term *rbag = def->rbag;
   const u32 rbag_len = def->rbag_len;
 
-  // offset calculation must occur before node_alloc() call
-  // TODO: i think we can use the return value of node_alloc() here
-  Loc offset = (tm->tid * NODE_LEN) + tm->nput - 1;
-  node_alloc(tm, nodes_len - 1);
+  static bool disp[10] = { false };
 
-  Term root = term_offset_loc(nodes[0], offset);
+  //Loc node_locs[64] = {32}; // REF_NOD_MAX
+  Loc node_locs[128] = {64};
+  u32 loc_cnt = (nodes_len - 1) / 2;
+  Term root = 0;
+  bool mat = term_tag(nodes[1]) == MAT;
+  if (!mat) {
+    for (u32 i = 0; i < loc_cnt; i++) {
+      node_locs[i] = node_alloc(tm, 2);
+    }
+    
+    root = node_offset_loc(nodes[0], node_locs);
 
-  // No redexes reference these nodes yet; safe to add without atomics
-  for (u32 n = 1; n < nodes_len; n++) {
-    Loc loc = offset + n;
-    Term term = term_offset_loc(nodes[n], offset);
-    BUFF[loc] = term;
-    MLOG(MOP_STOR, loc, term, 0);
+    // No redexes reference these terms yet; safe to add without atomics
+    for (u32 i = 0; i < loc_cnt; i++) {
+      Term neg = node_offset_loc(nodes[(i*2)+1], node_locs);
+      Term pos = node_offset_loc(nodes[(i*2)+2], node_locs);
+      Loc loc = node_locs[i];
+      //Pair pair = pair_new(neg, pos);
+      //*(Pair*)&BUFF[loc] = pair;
+      BUFF[loc] = neg;
+      BUFF[loc+1] = pos;
+      MLOG_PAIR(MOP_STOR, loc, pair_new(neg, pos));
+    }
+
+    for (u32 i = 0; i < rbag_len; i += 2) {
+      Term neg = node_offset_loc(rbag[i], node_locs);
+      Term pos = node_offset_loc(rbag[i+1], node_locs);
+      redex_push(tm, neg, pos, false);
+    }
   }
 
-  for (u32 i = 0; i < rbag_len; i += 2) {
-    Term neg = term_offset_loc(rbag[i], offset);
-    Term pos = term_offset_loc(rbag[i+1], offset);
-    redex_push(tm, neg, pos, false);
+  // eventually:
+  // -2 = var, bod; remainder = (ret + arms) * 2 = convert to SUB pairs
+  // nodes_len = (nodes_len - 2) * 2;
+  
+  if (mat || !disp[def_idx]) {
+    Loc offset = node_alloc(tm, nodes_len - 1) - 1;
+  
+    Term mat_root = term_offset_loc(nodes[0], offset);
+    if (mat) {
+      root = mat_root;
+
+      if (!disp[def_idx]) {
+        fprintf(stderr, "ADDR TAG LOC LAB\n");
+        fprintf(stderr, "----------------\n");
+      }
+    }
+  
+    for (u32 n = 1; n < nodes_len; n++) {
+      Loc loc = offset + n;
+      Term term = term_offset_loc(nodes[n], offset);
+      BUFF[loc] = term;
+      //char buf[64];
+      //fprintf(stderr, "%4u:  %s\n", loc, term_str(buf, term));
+      if (mat && !disp[def_idx]) {
+        dump_term(loc);
+      }
+    }
+
+    if (!mat) {
+      for (u32 i = 0; i < loc_cnt; i++) {
+        node_locs[loc_cnt + i] = offset + (i*2) + 1;
+      }
+      Loc nput = tm->nput;
+      tm->nput -= nodes_len - 1;
+      fprintf(stderr, "reset nput from %u to %u\n", nput, tm->nput);
+
+      fprintf(stderr, "--- %u %s ---\n", def_idx, def->name);
+      fprintf(stderr, "nput %u off %u len %u\n", tm->nput, offset, nodes_len - 1);
+      disp_terms(root, mat_root, node_locs, loc_cnt, mat);
+    }
+    
+    disp[def_idx] = true;
   }
+
   return root;
 }
 
@@ -1872,8 +1958,6 @@ static void* thread_func(void* arg) {
   tm->buse = true;
   tm->duse = true;
 
-  __attribute__((unused))
-  u64  fst_steal = 0;
   u64  tick = 0;
   bool busy = tm->tid == 0;
   while (true) {
@@ -2004,7 +2088,7 @@ static const char* term_str(char* buf, Term term) {
 
 static void dump_term(Loc loc) {
   Term term = get(loc);
-  printf("%04u %03u %03u %s\n", loc, term_loc(term), term_lab(term),
+  fprintf(stderr, "%04u %03u %03u %s\n", loc, term_loc(term), term_lab(term),
       tag_to_str(term_tag(term)));
 }
 
