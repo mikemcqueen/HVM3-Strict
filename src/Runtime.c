@@ -129,14 +129,14 @@ enum : u64 {
   CACH_U64 = CACH_SIZ / sizeof(u64),
 
   // Threads per CPU
-  TPC = 10,
+  TPC = 4,
 
   #ifdef __APPLE__
   // PCores and ECores total, and in-use
   PCOR_TOT = 4,
   ECOR_TOT = TPC - PCOR_TOT,
   PCOR = TPC < PCOR_TOT ? TPC : PCOR_TOT,
-  ECOR = TPC > PCOR_TOT ? (TPC - PCOR) : 0,
+  ECOR = TPC > PCOR_TOT ? (TPC - PCOR) : 1,
   #endif
 
   // Misc
@@ -572,7 +572,7 @@ TM *tm_new(u64 tid) {
   tm->lvic = TPC;
 #ifdef __APPLE__
   tm->pvic = tid % PCOR;
-  tm->evic = (tid % ECOR) + PCOR;
+  tm->evic = PCOR + (tid % ECOR);
 #endif // __APPLE__
 
   return tm;
@@ -673,6 +673,10 @@ Term get(Loc loc) {
   Term term = atomic_load_explicit((a64*)&BUFF[loc], memory_order_relaxed);
   MLOG(MOP_LOAD, loc, term, 0);
   return term;
+}
+
+Term peek(Loc loc) {
+  return BUFF[loc];
 }
 
 void set(Loc loc, Term term) {
@@ -1096,9 +1100,10 @@ char *def_name(Loc def_idx) { return BOOK.defs[def_idx].name; }
 
 static Term node_offset_loc(Term term, Loc* nod_locs) {
   if (!term_has_loc(term)) { return term; }
-  Loc loc = term_loc(term);
-  Loc nloc = (loc - 1) / 2;
-  Loc off = (loc - 1) & 1;
+  Loc loc = term_loc(term) - 1;
+  Loc nloc = loc >> 1;
+  Loc off = loc & 1;
+  // could make this | off with 2-term root node: neg terms always have even Loc
   return term_with_loc(term, nod_locs[nloc] + off);
 }
 
@@ -1145,19 +1150,19 @@ static Term expand_ref(TM *tm, Loc def_idx) {
   const Term *nodes = def->nodes;
   const Term *rbag = def->rbag;
   const u32 rbag_len = def->rbag_len;
-
   Loc node_locs[64];
-  u32 loc_cnt = (nodes_len - 1) / 2;
-  Term root = 0;
+
   bool mat = term_tag(nodes[1]) == MAT;
+  // loc_cnt == "number of term pairs"
+  u32 loc_cnt = mat ? 1 + (nodes_len - 3) : (nodes_len - 1) / 2;
+  for (u32 i = 0; i < loc_cnt; i++) {
+    node_locs[i] = node_alloc(tm, 2);
+  }
 
+  Term root = node_offset_loc(nodes[0], node_locs);
+
+  // No redexes reference these terms yet; safe to add without atomics
   if (!mat) {
-    for (u32 i = 0; i < loc_cnt; i++) {
-      node_locs[i] = node_alloc(tm, 2);
-    }
-    root = node_offset_loc(nodes[0], node_locs);
-
-    // No redexes reference these terms yet; safe to add without atomics
     for (u32 i = 0; i < loc_cnt; i++) {
       Term neg = node_offset_loc(nodes[(i*2)+1], node_locs);
       Term pos = node_offset_loc(nodes[(i*2)+2], node_locs);
@@ -1166,21 +1171,8 @@ static Term expand_ref(TM *tm, Loc def_idx) {
       BUFF[loc+1] = pos;
       MLOG_PAIR(MOP_STOR, loc, pair_new(neg, pos));
     }
-
-    for (u32 i = 0; i < rbag_len; i += 2) {
-      Term neg = node_offset_loc(rbag[i], node_locs);
-      Term pos = node_offset_loc(rbag[i+1], node_locs);
-      redex_push(tm, neg, pos, false);
-    }
-  } else {
-    // 1 = var, bod; remainder = ret, ...arms
-    loc_cnt = 1 + (nodes_len - 3);
-    for (u32 i = 0; i < loc_cnt; i++) {
-      node_locs[i] = node_alloc(tm, 2);
-    }
-    root = node_offset_loc(nodes[0], node_locs);
-
-    // Store root LAM var, bod
+  } else { /* MAT */
+    // First pair: store root LAM var, bod
     Term var = node_offset_loc(nodes[1], node_locs);
     Term bod = node_offset_loc(nodes[2], node_locs);
     Loc loc = node_locs[0];
@@ -1190,12 +1182,19 @@ static Term expand_ref(TM *tm, Loc def_idx) {
     
     for (u32 i = 1; i < loc_cnt; i++) {
       Term trm = node_offset_loc(nodes[i+2], node_locs);
+      // Add a "phony" SUB with Loc of next arm
       Term sub = term_new(SUB, 0, (i + 1 < loc_cnt) ? node_locs[i+1] : 0);
       Loc loc = node_locs[i];
       BUFF[loc] = trm;
       BUFF[loc+1] = sub;
       MLOG_PAIR(MOP_STOR, loc, pair_new(trm, sub));
     }
+  }
+
+  for (u32 i = 0; i < rbag_len; i += 2) {
+    Term neg = node_offset_loc(rbag[i], node_locs);
+    Term pos = node_offset_loc(rbag[i+1], node_locs);
+    redex_push(tm, neg, pos, false);
   }
   return root;
 }
@@ -1629,7 +1628,7 @@ static void interact_matnum(TM *tm, Loc ret, u32 mat_len, u32 n, Tag n_type) {
   // First arm is in ret's phony SUB
   Loc sub = port(2, ret);
   for (u32 i = 0; i < mat_len; i++) {
-    Loc arm = term_loc(get(sub));
+    Loc arm = term_loc(peek(sub));
     if (i == i_arm) {
       arm_loc = arm;
     } else {
@@ -1661,8 +1660,10 @@ static void interact_matnum(TM *tm, Loc ret, u32 mat_len, u32 n, Tag n_type) {
   }
 }
 
-// NOTE: not tested
 static void interact_matsup(TM *tm, Loc mat_loc, Lab mat_len, Loc sup_loc) {
+  fprintf(stderr, "interact_matsup needs some work for non-adjacent arms.\n");
+  exit(1);
+
   Loc ma0 = node_alloc(tm, mat_len + 1);
   Loc ma1 = node_alloc(tm, mat_len + 1);
   Loc sup = node_alloc(tm, 2);
@@ -1872,7 +1873,7 @@ static u32 get_victim(TM* tm) {
     tm->pvic = (tm->pvic - 1) % PCOR;
     return tm->pvic;
   } else {
-    tm->evic = (tm->evic - 1) % ECOR + PCOR;
+    tm->evic = PCOR + (tm->evic - 1) % ECOR;
     return tm->evic;
   }
 #else
