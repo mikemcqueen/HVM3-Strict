@@ -624,11 +624,13 @@ static bool term_has_loc(Term term) {
   return !(tag == SUB || tag == NUL || tag == ERA || tag == REF || tag == U32);
 }
 
+#if 0
 static Term term_offset_loc(Term term, Loc offset) {
   if (!term_has_loc(term)) { return term; }
   Loc loc = term_loc(term) + offset;
   return term_with_loc(term, loc);
 }
+#endif
 
 static Loc port(u32 n, Loc loc) { return n + loc - 1; }
 
@@ -1101,23 +1103,36 @@ static Term node_offset_loc(Term term, Loc* nod_locs) {
 }
 
 // side by side
+#if 0
 static void disp_sbs(Term t1, Loc loc1, Term t2, Loc loc2) {
   fprintf(stderr, "%04u %s %03u %03u    %04u %s %03u %03u\n",
          loc1, tag_to_str(term_tag(t1)), term_loc(t1), term_lab(t1), 
          loc2, tag_to_str(term_tag(t2)), term_loc(t2), term_lab(t2));
 }
 
-static void disp_terms(Term root1, Term root2, Loc *node_locs, u32 loc_cnt, bool mat) {
+static void disp_terms(Term root1, Term root2, Loc *node_locs, u32 loc_cnt, u32 mat_arms) {
   fprintf(stderr, "ADDR TAG LOC LAB    ADDR TAG LOC LAB\n");
   fprintf(stderr, "----------------    ----------------\n");
   disp_sbs(root1, 0, root2, 0);
   for (u32 i = 0; i < loc_cnt; i++) {
     Loc loc1 = node_locs[i];
-    Loc loc2 = mat ? node_locs[i] : node_locs[loc_cnt + i];
-    disp_sbs(BUFF[loc1], loc1, BUFF[loc2], loc2);
-    disp_sbs(BUFF[loc1+1], loc1+1, BUFF[loc2+1], loc2+1);
+    Loc loc2 = 0;
+    Loc loc4 = 0;
+    Term t4 = 0;
+    if ((i == 0) || (mat_arms == 0)) {
+      loc2 = node_locs[loc_cnt + i];
+      loc4 = loc2 + 1;
+      t4 = BUFF[loc2+1];
+    } else {
+      if (i <= mat_arms) {
+        loc2 = node_locs[loc_cnt] + i + 1;
+      }
+    }
+    disp_sbs(BUFF[loc1], loc1, (loc2 > 0) ? BUFF[loc2] : 0, loc2);
+    disp_sbs(BUFF[loc1+1], loc1+1, t4, loc4);
   }
 }
+#endif
 
 // Expands a ref's data into a linear block of nodes with its nodes' locs
 // offset by the index where in the BUFF it was expanded.
@@ -1131,18 +1146,15 @@ static Term expand_ref(TM *tm, Loc def_idx) {
   const Term *rbag = def->rbag;
   const u32 rbag_len = def->rbag_len;
 
-  static bool disp[10] = { false };
-
-  //Loc node_locs[64] = {32}; // REF_NOD_MAX
-  Loc node_locs[128] = {64};
+  Loc node_locs[64];
   u32 loc_cnt = (nodes_len - 1) / 2;
   Term root = 0;
   bool mat = term_tag(nodes[1]) == MAT;
+
   if (!mat) {
     for (u32 i = 0; i < loc_cnt; i++) {
       node_locs[i] = node_alloc(tm, 2);
     }
-    
     root = node_offset_loc(nodes[0], node_locs);
 
     // No redexes reference these terms yet; safe to add without atomics
@@ -1150,8 +1162,6 @@ static Term expand_ref(TM *tm, Loc def_idx) {
       Term neg = node_offset_loc(nodes[(i*2)+1], node_locs);
       Term pos = node_offset_loc(nodes[(i*2)+2], node_locs);
       Loc loc = node_locs[i];
-      //Pair pair = pair_new(neg, pos);
-      //*(Pair*)&BUFF[loc] = pair;
       BUFF[loc] = neg;
       BUFF[loc+1] = pos;
       MLOG_PAIR(MOP_STOR, loc, pair_new(neg, pos));
@@ -1162,52 +1172,31 @@ static Term expand_ref(TM *tm, Loc def_idx) {
       Term pos = node_offset_loc(rbag[i+1], node_locs);
       redex_push(tm, neg, pos, false);
     }
-  }
-
-  // eventually:
-  // -2 = var, bod; remainder = (ret + arms) * 2 = convert to SUB pairs
-  // nodes_len = (nodes_len - 2) * 2;
-  
-  if (mat || !disp[def_idx]) {
-    Loc offset = node_alloc(tm, nodes_len - 1) - 1;
-  
-    Term mat_root = term_offset_loc(nodes[0], offset);
-    if (mat) {
-      root = mat_root;
-
-      if (!disp[def_idx]) {
-        fprintf(stderr, "ADDR TAG LOC LAB\n");
-        fprintf(stderr, "----------------\n");
-      }
+  } else {
+    // 1 = var, bod; remainder = ret, ...arms
+    loc_cnt = 1 + (nodes_len - 3);
+    for (u32 i = 0; i < loc_cnt; i++) {
+      node_locs[i] = node_alloc(tm, 2);
     }
-  
-    for (u32 n = 1; n < nodes_len; n++) {
-      Loc loc = offset + n;
-      Term term = term_offset_loc(nodes[n], offset);
-      BUFF[loc] = term;
-      //char buf[64];
-      //fprintf(stderr, "%4u:  %s\n", loc, term_str(buf, term));
-      if (mat && !disp[def_idx]) {
-        dump_term(loc);
-      }
-    }
+    root = node_offset_loc(nodes[0], node_locs);
 
-    if (!mat) {
-      for (u32 i = 0; i < loc_cnt; i++) {
-        node_locs[loc_cnt + i] = offset + (i*2) + 1;
-      }
-      Loc nput = tm->nput;
-      tm->nput -= nodes_len - 1;
-      fprintf(stderr, "reset nput from %u to %u\n", nput, tm->nput);
-
-      fprintf(stderr, "--- %u %s ---\n", def_idx, def->name);
-      fprintf(stderr, "nput %u off %u len %u\n", tm->nput, offset, nodes_len - 1);
-      disp_terms(root, mat_root, node_locs, loc_cnt, mat);
-    }
+    // Store root LAM var, bod
+    Term var = node_offset_loc(nodes[1], node_locs);
+    Term bod = node_offset_loc(nodes[2], node_locs);
+    Loc loc = node_locs[0];
+    BUFF[loc] = var;
+    BUFF[loc+1] = bod;
+    MLOG_PAIR(MOP_STOR, loc, pair_new(var, bod));
     
-    disp[def_idx] = true;
+    for (u32 i = 1; i < loc_cnt; i++) {
+      Term trm = node_offset_loc(nodes[i+2], node_locs);
+      Term sub = term_new(SUB, 0, (i + 1 < loc_cnt) ? node_locs[i+1] : 0);
+      Loc loc = node_locs[i];
+      BUFF[loc] = trm;
+      BUFF[loc+1] = sub;
+      MLOG_PAIR(MOP_STOR, loc, pair_new(trm, sub));
+    }
   }
-
   return root;
 }
 
@@ -1629,21 +1618,37 @@ static void interact_matnul(TM *tm, Loc a_loc, Lab mat_len) {
   }
 }
 
-static void interact_matnum(TM *tm, Loc mat_loc, Lab mat_len, u32 n, Tag n_type) {
+static void interact_matnum(TM *tm, Loc ret, u32 mat_len, u32 n, Tag n_type) {
   if (n_type != U32) {
     fprintf(stderr, "match with non-U32\n");
     exit(1);
   }
 
   u32 i_arm = (n < mat_len - 1) ? n : (mat_len - 1);
+  Loc arm_loc = 0;
+  // First arm is in ret's phony SUB
+  Loc sub = port(2, ret);
   for (u32 i = 0; i < mat_len; i++) {
-    if (i != i_arm) {
-      link_terms(tm, term_new(ERA, 0, 0), take(port(2 + i, mat_loc)));
+    Loc arm = term_loc(get(sub));
+    if (i == i_arm) {
+      arm_loc = arm;
+    } else {
+      link_terms(tm, term_new(ERA, 0, 0), take(arm));
     }
+    // Next arm is in arm's phony SUB
+    sub = port(2, arm);
   }
 
-  Loc ret = port(1, mat_loc);
-  Term arm = take(port(2 + i_arm, mat_loc));
+  Term arm = take(arm_loc);
+
+  #if 0
+  if (term_tag(arm) != REF) {
+    fprintf(stderr, "non-REF arm @ %u i_arm %u n %u mat_len %u ret_loc %u\n",
+            arm_loc, i_arm, n, mat_len, ret);
+    exit(1);
+  }
+  #endif
+
   if (i_arm < mat_len - 1) {
     move(tm, ret, arm);
   } else {
@@ -1797,7 +1802,7 @@ static bool interact(TM *tm, Term neg, Term pos) {
     case U32:
     case I32:
     case F32:
-      interact_matnum(tm, neg_loc, term_lab(neg), pos_loc, pos_tag);
+      interact_matnum(tm, term_loc(neg), term_lab(neg), pos_loc, pos_tag);
       break;
     case REF:
       link_terms(tm, neg, expand_ref(tm, pos_loc));
